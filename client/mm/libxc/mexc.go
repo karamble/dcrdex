@@ -235,8 +235,8 @@ func newMEXC(cfg *CEXConfig) (*mexc, error) {
 	marketWsCfg.Logger = marketLogger // Assign market logger
 	marketWsCfg.URL = mexcWsURL
 	marketWsCfg.RawHandler = m.handleMarketRawMessage // Assign market raw handler
-	// Don't auto-resubscribe on reconnection - let the markets maintain their state
-	marketWsCfg.ReconnectSync = nil // MEXC maintains subscriptions, no need to resubscribe on reconnect
+	// Important: Do NOT set ReconnectSync handler - let the connection manager handle reconnects naturally
+	marketWsCfg.ReconnectSync = nil
 	marketWsCfg.ConnectEventFunc = m.handleMarketConnectEvent
 	marketWsCfg.PingWait = 120 * time.Second // Decreased PingWait for market stream
 	marketStream, err := comms.NewWsConn(&marketWsCfg)
@@ -2027,8 +2027,6 @@ func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol strin
 	// No active subscription yet, create a new one
 	if m.marketStream == nil || m.marketStream.IsDown() {
 		m.marketStreamMtx.Unlock()
-		// This check is slightly redundant if caller holds lock and checks,
-		// but provides safety if called incorrectly.
 		return fmt.Errorf("market stream not connected when trying to subscribe to %s", mexcSymbol)
 	}
 
@@ -2036,18 +2034,14 @@ func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol strin
 	m.marketSubs[mexcSymbol] = 1
 	m.marketStreamMtx.Unlock()
 
-	// Construct the channel name for MEXC depth subscription
-	// "spot@public.increase.depth.v3.api@BTCUSDT"
+	// Simple channel name for MEXC depth subscription
 	channel := fmt.Sprintf("spot@public.increase.depth.v3.api@%s", mexcSymbol)
 
-	// Construct the subscription request
+	// Basic subscription request - removed extra ID field
 	req := mexctypes.WsRequest{
 		Method: "SUBSCRIPTION",
 		Params: []string{channel},
-		ID:     time.Now().UnixNano(), // Add a unique ID to track this subscription
 	}
-
-	m.log.Debugf("[MarketWS] Subscription request format: %+v", req)
 
 	reqBytes, marshalErr := json.Marshal(req)
 	if marshalErr != nil {
@@ -2058,23 +2052,18 @@ func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol strin
 		return fmt.Errorf("failed to marshal market subscription request for %s: %w", mexcSymbol, marshalErr)
 	}
 
-	m.log.Debugf("[MarketWS] Sending SUBSCRIPTION for %s: %s", mexcSymbol, string(reqBytes))
+	m.log.Debugf("[MarketWS] Sending subscription for %s", mexcSymbol)
 	err := m.marketStream.SendRaw(reqBytes)
 	if err != nil {
 		// Clean up subscription tracking if we failed
 		m.marketStreamMtx.Lock()
 		delete(m.marketSubs, mexcSymbol)
 		m.marketStreamMtx.Unlock()
-		// Log the error, WsConn might handle reconnect, but the sub likely failed for now.
 		m.log.Errorf("Failed to send market subscription for %s: %v", mexcSymbol, err)
 		return fmt.Errorf("failed to send market subscription for %s: %w", mexcSymbol, err)
 	}
 
 	m.log.Infof("[MarketWS] Sent subscription request for market %s", mexcSymbol)
-
-	// Wait a brief moment to let the subscription take effect
-	time.Sleep(100 * time.Millisecond)
-
 	return nil
 }
 
@@ -2245,8 +2234,8 @@ func (m *mexc) handleDepthUpdate(msg *mexctypes.WsMessage) {
 
 	var update mexctypes.WsDepthUpdateData
 	if err := json.Unmarshal(msg.Data, &update); err != nil {
-		m.log.Errorf("[MarketWS] Failed to unmarshal depth update data for %s: %v, data: %s",
-			msg.Symbol, err, string(msg.Data))
+		m.log.Errorf("[MarketWS] Failed to unmarshal depth update data for %s: %v",
+			msg.Symbol, err)
 		return
 	}
 
@@ -2262,26 +2251,14 @@ func (m *mexc) handleDepthUpdate(msg *mexctypes.WsMessage) {
 		return
 	}
 
-	// If we reached here, we are indeed receiving depth updates for the market
-	m.log.Tracef("[MarketWS] Processing depth update for %s, version: %s", msg.Symbol, update.Version)
-
-	// Enqueue the update to be processed by the orderbook's run goroutine
+	// Simply enqueue the update for processing by the orderbook's run goroutine
 	select {
 	case book.updateQueue <- &update:
-		// Update successfully enqueued
 		m.log.Tracef("[MarketWS] Depth update enqueued for %s", msg.Symbol)
 	default:
-		// Queue is full, this indicates processing is backed up
-		m.log.Warnf("[MarketWS] Depth update queue full for %s, dropping update", msg.Symbol)
-		// Mark book as unsynced when updates are dropped
-		book.synced.Store(false)
-		// Signal for resync
-		select {
-		case m.marketSubResyncChan <- msg.Symbol:
-			m.log.Debugf("[MarketWS] Requested resync for %s due to full update queue", msg.Symbol)
-		default:
-			// Resync already pending
-		}
+		m.log.Warnf("[MarketWS] Depth update queue full for %s", msg.Symbol)
+		// Even if queue is full, don't forcibly mark as unsynced - let the orderbook
+		// detect sequence problems naturally
 	}
 }
 
@@ -3700,13 +3677,12 @@ func (ob *mexcOrderBook) run(ctx context.Context, resyncChan chan string) {
 			}
 		case connected := <-ob.connectedChan:
 			if !connected {
-				ob.log.Debugf("Market connection down for %s, maintaining current sync state", ob.mktSymbol)
-				// Do NOT mark the book as unsynced due to connection state changes alone
-				// The book will determine if it needs a resync based on sequence numbers when updates resume
+				ob.log.Debugf("Market connection down for %s, but maintaining sync state", ob.mktSymbol)
+				// DO NOT mark the book as unsynced due to connection status changes
+				// The sequence number validation in processUpdate will handle this properly
 			} else {
-				// Connection is established, just log it and let the sequence numbers determine sync state
-				ob.log.Debugf("Market connection up for %s, maintaining current sync state. Sequence-based validation will determine if resync needed.", ob.mktSymbol)
-				// IMPORTANT: Do not trigger resync based on connection status alone
+				ob.log.Debugf("Market connection restored for %s, maintaining current sync state", ob.mktSymbol)
+				// DO NOT trigger resyncs based solely on connection status
 			}
 		}
 	}
@@ -3793,6 +3769,9 @@ drainLoop:
 
 // processUpdate handles an incoming WebSocket depth update.
 func (ob *mexcOrderBook) processUpdate(update *mexctypes.WsDepthUpdateData, resyncChan chan<- string) {
+	// Log new update for diagnostic purposes
+	ob.log.Debugf("Processing depth update for %s with version: %s", ob.mktSymbol, update.Version)
+
 	updateVersion, err := strconv.ParseUint(update.Version, 10, 64)
 	if err != nil {
 		ob.log.Errorf("Failed to parse update version '%s' for %s: %v. Requesting resync.", update.Version, ob.mktSymbol, err)
@@ -3819,6 +3798,7 @@ func (ob *mexcOrderBook) processUpdate(update *mexctypes.WsDepthUpdateData, resy
 		return
 	}
 
+	// Looks good, should be sequential update
 	bids, asks, err := ob.convertDepthEntries(update.Bids, update.Asks)
 	if err != nil {
 		ob.log.Errorf("Error converting update entries for %s (v%d): %v. Requesting resync.", ob.mktSymbol, updateVersion, err)
@@ -3831,8 +3811,21 @@ func (ob *mexcOrderBook) processUpdate(update *mexctypes.WsDepthUpdateData, resy
 	ob.log.Debugf("Processing depth update for %s (Version: %d -> %d, Bids: %d, Asks: %d)",
 		ob.mktSymbol, ob.lastUpdateID, updateVersion, bidCount, askCount)
 
+	// Log detailed information about the update being applied
+	ob.log.Infof("Applying depth update: Market=%s, LastID=%d, NewID=%d, Bids=%d, Asks=%d",
+		ob.mktSymbol, ob.lastUpdateID, updateVersion, bidCount, askCount)
+
+	// Log some sample bid/ask data if available for debugging
+	if bidCount > 0 && askCount > 0 {
+		// Log first bid and ask for diagnostics
+		ob.log.Debugf("Sample bid: rate=%v, qty=%v", bids[0].rate, bids[0].qty)
+		ob.log.Debugf("Sample ask: rate=%v, qty=%v", asks[0].rate, asks[0].qty)
+	}
+
 	ob.book.update(bids, asks)
 	ob.lastUpdateID = updateVersion
+
+	ob.log.Debugf("DIAGNOSTIC: Successfully applied depth update for %s, new version: %d", ob.mktSymbol, updateVersion)
 }
 
 // requestResync marks the book as unsynced and signals for a resync.
@@ -3874,67 +3867,4 @@ func (ob *mexcOrderBook) convertDepthEntries(mexcBids, mexcAsks [][2]json.Number
 		return nil, nil, fmt.Errorf("asks: %w", err)
 	}
 	return bids, asks, nil
-}
-
-// StopTrading cleans up resources associated with trading a specific base/quote pair.
-// This should be called when the user stops the bot to ensure a clean restart with fresh orderbooks.
-func (m *mexc) StopTrading(baseID, quoteID uint32) error {
-	m.log.Infof("Stopping trading for MEXC market %d/%d", baseID, quoteID)
-
-	// 1. Map IDs to MEXC symbol
-	mexcSymbol, err := m.mapDEXIDsToMEXCSymbol(baseID, quoteID)
-	if err != nil {
-		return fmt.Errorf("cannot map DEX IDs to MEXC symbol for stop trading: %w", err)
-	}
-
-	// 2. Check if we're actually subscribed to this market
-	m.booksMtx.RLock()
-	_, exists := m.books[mexcSymbol]
-	m.booksMtx.RUnlock()
-	if !exists {
-		m.log.Warnf("Attempted to stop trading on non-subscribed market %s (%d/%d)", mexcSymbol, baseID, quoteID)
-		return nil // Not subscribed, nothing to do
-	}
-
-	// 3. Unsubscribe from the market (this handles WebSocket cleanup)
-	if err := m.UnsubscribeMarket(baseID, quoteID); err != nil {
-		m.log.Errorf("Error unsubscribing from market %s (%d/%d) during stop trading: %v",
-			mexcSymbol, baseID, quoteID, err)
-		// Continue with cleanup even if unsubscribe fails
-	}
-
-	// 4. Cleanup any active trades for this market
-	m.activeTradesMtx.Lock()
-	for tradeID, tradeInfo := range m.activeTrades {
-		if tradeInfo.baseID == baseID && tradeInfo.quoteID == quoteID {
-			delete(m.activeTrades, tradeID)
-			m.log.Debugf("Removed active trade %s for market %s from tracking during stop trading",
-				tradeID, mexcSymbol)
-		}
-	}
-	m.activeTradesMtx.Unlock()
-
-	// 5. Double-check that the book was actually removed (it should be by UnsubscribeMarket)
-	m.booksMtx.Lock()
-	if _, stillExists := m.books[mexcSymbol]; stillExists {
-		// The book is still in the map (possibly from other subscribers)
-		// Let's forcibly stop and remove it to ensure clean restart
-		book := m.books[mexcSymbol]
-		delete(m.books, mexcSymbol)
-		m.log.Warnf("Forcibly removed orderbook for %s during stop trading", mexcSymbol)
-
-		// Stop the book outside the lock
-		m.booksMtx.Unlock()
-		book.stop()
-	} else {
-		m.booksMtx.Unlock()
-	}
-
-	// 6. Clean up market subscription tracking
-	m.marketStreamMtx.Lock()
-	delete(m.marketSubs, mexcSymbol)
-	m.marketStreamMtx.Unlock()
-
-	m.log.Infof("Successfully stopped trading for MEXC market %s (%d/%d)", mexcSymbol, baseID, quoteID)
-	return nil
 }
