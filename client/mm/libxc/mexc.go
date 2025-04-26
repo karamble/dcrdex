@@ -1945,12 +1945,12 @@ func (m *mexc) connectMarketStream(ctx context.Context, firstMexcSymbol string) 
 
 // handleMarketConnectEvent handles connection status changes.
 func (m *mexc) handleMarketConnectEvent(status comms.ConnectionStatus) {
-	m.log.Debugf("Market stream connection status changed: %s", status)
+	m.log.Infof("Market stream connection status changed: %s", status)
 
 	switch status {
 	case comms.Connected:
-		// Re-subscribe to all markets on reconnection
-		m.resubscribeMarkets()
+		// MEXC maintains subscriptions on their end, no need to resubscribe
+		m.log.Infof("[MarketWS] Connection established, waiting for market data to resume")
 
 		// Notify all books that connection is established
 		m.booksMtx.RLock()
@@ -1976,12 +1976,13 @@ func (m *mexc) handleMarketConnectEvent(status comms.ConnectionStatus) {
 		m.booksMtx.RUnlock()
 
 	case comms.Disconnected:
+		m.log.Warnf("[MarketWS] Disconnected from market data stream, orderbooks will validate sequence numbers on reconnect")
 		// Notify books of disconnection but don't mark them as unsynced
 		// The orderbook will remain synced during disconnection and will determine
 		// if it needs a resync based on sequence numbers after reconnection
 		m.booksMtx.RLock()
 		for _, book := range m.books {
-			// Don't mark as unsynced here - removed: book.synced.Store(false)
+			// Don't mark as unsynced here - orderbooks will check sequence numbers when updates resume
 			select {
 			case book.connectedChan <- false:
 				m.log.Debugf("Sent connected=false notification to book for %s", book.mktSymbol)
@@ -2073,11 +2074,13 @@ func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 
 	// Handle server-sent PING { "ping": timestamp }
 	if baseMsg.Ping != 0 {
-		m.log.Tracef("[MarketWS] Received MEXC Server Ping object: %d", baseMsg.Ping)
+		m.log.Debugf("[MarketWS] Received MEXC Server Ping: %d", baseMsg.Ping) // Enhanced logging
 		pong := mexctypes.WsPong{Pong: baseMsg.Ping}
 		pongBytes, _ := json.Marshal(pong)
 		if errPong := m.marketStream.SendRaw(pongBytes); errPong != nil {
 			m.log.Errorf("[MarketWS] Failed to send MEXC Pong response: %v", errPong)
+		} else {
+			m.log.Debugf("[MarketWS] Sent MEXC Pong response: %d", baseMsg.Ping) // Enhanced logging
 		}
 		return
 	}
@@ -2090,6 +2093,7 @@ func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 			m.log.Warnf("[MarketWS] Received depth update message with missing/null data field: %s", string(msgBytes))
 			return
 		}
+		m.log.Debugf("[MarketWS] Received depth update for %s", baseMsg.Symbol) // Enhanced logging
 		m.handleDepthUpdate(&baseMsg)
 		return // Handled depth update
 	}
@@ -2115,6 +2119,9 @@ func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 				parts := strings.Split(channel, "@")
 				if len(parts) >= 4 {
 					symbol := parts[3]
+
+					// Enhanced logging for subscription messages
+					m.log.Infof("[MarketWS] Received subscription response for %s: %s", symbol, genericResp.Msg)
 
 					// Check if it's a subscription error due to limit
 					if strings.Contains(genericResp.Msg, "Exceeded maximum subscription limit") {
@@ -2204,7 +2211,7 @@ func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 		}
 
 		// Log PONG or anything else structured but not recognized
-		m.log.Warnf("[MarketWS] Received unknown structured WS message: %s", string(msgBytes))
+		m.log.Debugf("[MarketWS] Received structured WS message: %s", string(msgBytes)) // Enhanced logging
 		return
 	}
 
@@ -2214,7 +2221,47 @@ func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 
 // handleDepthUpdate parses the data part of the depth update and forwards it.
 func (m *mexc) handleDepthUpdate(msg *mexctypes.WsMessage) {
-	// ... function body ...
+	if msg.Symbol == "" {
+		m.log.Errorf("[MarketWS] Received depth update with missing symbol")
+		return
+	}
+
+	var update mexctypes.WsDepthUpdateData
+	if err := json.Unmarshal(msg.Data, &update); err != nil {
+		m.log.Errorf("[MarketWS] Failed to unmarshal depth update data for %s: %v, data: %s",
+			msg.Symbol, err, string(msg.Data))
+		return
+	}
+
+	// Find the corresponding orderbook
+	m.booksMtx.RLock()
+	book, exists := m.books[msg.Symbol]
+	m.booksMtx.RUnlock()
+
+	if !exists {
+		// This can happen during normal operation if we've unsubscribed from a market
+		// but still receive a few lingering updates.
+		// m.log.Tracef("[MarketWS] Received depth update for non-tracked symbol %s", msg.Symbol)
+		return
+	}
+
+	// Enqueue the update to be processed by the orderbook's run goroutine
+	select {
+	case book.updateQueue <- &update:
+		// Update successfully enqueued
+	default:
+		// Queue is full, this indicates processing is backed up
+		m.log.Warnf("[MarketWS] Depth update queue full for %s, dropping update", msg.Symbol)
+		// Mark book as unsynced when updates are dropped
+		book.synced.Store(false)
+		// Signal for resync
+		select {
+		case m.marketSubResyncChan <- msg.Symbol:
+			m.log.Debugf("[MarketWS] Requested resync for %s due to full update queue", msg.Symbol)
+		default:
+			// Resync already pending
+		}
+	}
 }
 
 // resubscribeMarkets sends subscription messages for all currently tracked markets.
@@ -2259,6 +2306,8 @@ func (m *mexc) resubscribeMarkets() {
 	// Now resubscribe each market to the websocket feed
 	alreadySubscribed := make(map[string]bool)
 
+	// MEXC has a limit on the number of simultaneous subscriptions
+	// Let's resubscribe with a slight delay between each to avoid hitting limits
 	for symbol := range m.books {
 		// Skip if we've already sent a subscription for this symbol
 		if alreadySubscribed[symbol] {
@@ -2294,9 +2343,14 @@ func (m *mexc) resubscribeMarkets() {
 			delete(m.marketSubs, symbol)
 			m.marketStreamMtx.Unlock()
 		} else {
-			m.log.Debugf("[Resubscribe] Successfully resubscribed to %s", symbol)
+			m.log.Infof("[Resubscribe] Successfully sent resubscription request for %s", symbol)
+
+			// Add a small delay between subscriptions to avoid hitting rate limits
+			time.Sleep(500 * time.Millisecond)
 		}
 	}
+
+	m.log.Infof("Completed resubscription requests for all markets")
 }
 
 // --- CEX Interface Method Placeholders ---
@@ -3623,7 +3677,7 @@ func (ob *mexcOrderBook) run(ctx context.Context, resyncChan chan string) {
 				ob.log.Infof("Received resync request for %s, attempting sync...", ob.mktSymbol)
 				// Attempt sync (will mark synced=true on success)
 				if !ob.syncOrderbook(ctx) {
-					ob.log.Errorf("Resync attempt failed for %s, will retry later", ob.mktSymbol)
+					ob.log.Errorf("Resync attempt failed for %s", ob.mktSymbol)
 				}
 			} // Ignore requests for other symbols
 		case <-resyncTicker.C:
@@ -3636,34 +3690,18 @@ func (ob *mexcOrderBook) run(ctx context.Context, resyncChan chan string) {
 			}
 		case connected := <-ob.connectedChan:
 			if !connected {
-				ob.log.Debugf("Market connection down, marking %s orderbook as unsynced", ob.mktSymbol)
-				ob.synced.Store(false)
+				ob.log.Debugf("Market connection down for %s, maintaining current sync state", ob.mktSymbol)
+				// Do NOT mark the book as unsynced due to connection state changes alone
+				// The book will determine if it needs a resync based on sequence numbers when updates resume
 			} else {
 				// Connection is established, trigger a resync if book is not synced
-				// Instead of immediately sending on resyncChan (which might be full),
-				// we'll attempt the resync right here
 				if !ob.synced.Load() {
-					ob.log.Debugf("Market connection up, initiating resync for %s", ob.mktSymbol)
-					if !ob.syncOrderbook(ctx) {
-						ob.log.Errorf("Resync attempt after connection restore failed for %s, will retry later", ob.mktSymbol)
-						// Schedule retry via resyncChan with delay to avoid hammering
-						go func() {
-							select {
-							case <-time.After(5 * time.Second):
-								select {
-								case resyncChan <- ob.mktSymbol:
-									ob.log.Debugf("Scheduled delayed resync for %s after failed attempt", ob.mktSymbol)
-								default:
-									ob.log.Warnf("Resync channel full when trying to schedule delayed resync for %s", ob.mktSymbol)
-								}
-							case <-ctx.Done():
-								return
-							case <-ob.stopChan:
-								return
-							}
-						}()
-					} else {
-						ob.log.Infof("Successfully resynced %s orderbook after connection restore", ob.mktSymbol)
+					ob.log.Debugf("Market connection up, scheduling resync for %s", ob.mktSymbol)
+					select {
+					case resyncChan <- ob.mktSymbol:
+						ob.log.Debugf("Resync request sent for %s after connection restore", ob.mktSymbol)
+					default:
+						ob.log.Warnf("Resync channel full when trying to signal %s after connection restore", ob.mktSymbol)
 					}
 				}
 			}
