@@ -4,8 +4,9 @@ import "encoding/json"
 
 // Generic websocket message structure
 type WsRequest struct {
-	Method string   `json:"method"` // e.g., "SUBSCRIPTION", "UNSUBSCRIPTION"
-	Params []string `json:"params"` // e.g., ["spot@public.increase.depth.v3.api@BTCUSDT"]
+	Method string      `json:"method"`       // e.g., "SUBSCRIPTION", "UNSUBSCRIPTION"
+	Params []string    `json:"params"`       // e.g., ["spot@public.increase.depth.v3.api@BTCUSDT"]
+	ID     interface{} `json:"id,omitempty"` // Optional request ID
 }
 
 // Generic incoming message to determine type

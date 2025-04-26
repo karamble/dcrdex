@@ -2036,11 +2036,19 @@ func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol strin
 	m.marketSubs[mexcSymbol] = 1
 	m.marketStreamMtx.Unlock()
 
+	// Construct the channel name for MEXC depth subscription
+	// "spot@public.increase.depth.v3.api@BTCUSDT"
 	channel := fmt.Sprintf("spot@public.increase.depth.v3.api@%s", mexcSymbol)
+
+	// Construct the subscription request
 	req := mexctypes.WsRequest{
 		Method: "SUBSCRIPTION",
 		Params: []string{channel},
+		ID:     time.Now().UnixNano(), // Add a unique ID to track this subscription
 	}
+
+	m.log.Debugf("[MarketWS] Subscription request format: %+v", req)
+
 	reqBytes, marshalErr := json.Marshal(req)
 	if marshalErr != nil {
 		// Clean up subscription tracking if we failed
@@ -2050,7 +2058,7 @@ func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol strin
 		return fmt.Errorf("failed to marshal market subscription request for %s: %w", mexcSymbol, marshalErr)
 	}
 
-	m.log.Debugf("[MarketWS] Sending SUBSCRIPTION for %s", mexcSymbol)
+	m.log.Debugf("[MarketWS] Sending SUBSCRIPTION for %s: %s", mexcSymbol, string(reqBytes))
 	err := m.marketStream.SendRaw(reqBytes)
 	if err != nil {
 		// Clean up subscription tracking if we failed
@@ -2063,11 +2071,17 @@ func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol strin
 	}
 
 	m.log.Infof("[MarketWS] Sent subscription request for market %s", mexcSymbol)
+
+	// Wait a brief moment to let the subscription take effect
+	time.Sleep(100 * time.Millisecond)
+
 	return nil
 }
 
 // handleMarketRawMessage parses raw byte messages from the WebSocket.
 func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
+	m.log.Tracef("[MarketWS] Raw message received: %s", string(msgBytes))
+
 	// Try to unmarshal as the base message type first
 	var baseMsg mexctypes.WsMessage
 	if err := json.Unmarshal(msgBytes, &baseMsg); err != nil {
@@ -2096,7 +2110,7 @@ func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 			m.log.Warnf("[MarketWS] Received depth update message with missing/null data field: %s", string(msgBytes))
 			return
 		}
-		m.log.Debugf("[MarketWS] Received depth update for %s", baseMsg.Symbol) // Enhanced logging
+		m.log.Infof("[MarketWS] Received depth update for %s", baseMsg.Symbol) // Changed to Infof for visibility
 		m.handleDepthUpdate(&baseMsg)
 		return // Handled depth update
 	}
@@ -2244,14 +2258,18 @@ func (m *mexc) handleDepthUpdate(msg *mexctypes.WsMessage) {
 	if !exists {
 		// This can happen during normal operation if we've unsubscribed from a market
 		// but still receive a few lingering updates.
-		// m.log.Tracef("[MarketWS] Received depth update for non-tracked symbol %s", msg.Symbol)
+		m.log.Tracef("[MarketWS] Received depth update for non-tracked symbol %s", msg.Symbol)
 		return
 	}
+
+	// If we reached here, we are indeed receiving depth updates for the market
+	m.log.Tracef("[MarketWS] Processing depth update for %s, version: %s", msg.Symbol, update.Version)
 
 	// Enqueue the update to be processed by the orderbook's run goroutine
 	select {
 	case book.updateQueue <- &update:
 		// Update successfully enqueued
+		m.log.Tracef("[MarketWS] Depth update enqueued for %s", msg.Symbol)
 	default:
 		// Queue is full, this indicates processing is backed up
 		m.log.Warnf("[MarketWS] Depth update queue full for %s, dropping update", msg.Symbol)
@@ -2269,6 +2287,8 @@ func (m *mexc) handleDepthUpdate(msg *mexctypes.WsMessage) {
 
 // resubscribeMarkets sends subscription messages for all currently tracked markets.
 func (m *mexc) resubscribeMarkets() {
+	m.log.Infof("*** MEXC DIAGNOSTIC: resubscribeMarkets called - this should NOT happen automatically ***")
+
 	m.booksMtx.RLock()
 	defer m.booksMtx.RUnlock()
 
@@ -2277,27 +2297,10 @@ func (m *mexc) resubscribeMarkets() {
 	}
 	m.log.Infof("Resubscribing to %d markets after reconnect...", len(m.books))
 
-	// First, ensure sync channels are properly set up for tracking
+	// IMPORTANT: Do not mark books as unsynced here
 	for symbol, book := range m.books {
-		// DO NOT mark as unsynced explicitly - maintain current sync state
-		// book.synced.Store(false) - REMOVED
-
-		// Create a new syncChan for this book ONLY if not already synced
-		// to ensure anyone waiting on syncChan.Close() will be notified
-		if !book.synced.Load() {
-			book.mtx.Lock()
-			select {
-			case <-book.syncChan:
-				// Already closed, create a new one
-			default:
-				// Not closed, close it to notify any waiters, then create a new one
-				close(book.syncChan)
-			}
-			book.syncChan = make(chan struct{})
-			book.mtx.Unlock()
-		}
-
-		m.log.Debugf("Market %s marked for connection restore after reconnection", symbol)
+		m.log.Debugf("Market %s connection restored - maintaining current sync state: %v",
+			symbol, book.synced.Load())
 	}
 
 	// Before we send new subscription requests, clear the subscription tracking
@@ -2334,6 +2337,7 @@ func (m *mexc) resubscribeMarkets() {
 		req := mexctypes.WsRequest{
 			Method: "SUBSCRIPTION",
 			Params: []string{channel},
+			ID:     time.Now().UnixNano(), // Add a unique ID to track this subscription
 		}
 		reqBytes, err := json.Marshal(req)
 		if err != nil {
@@ -3700,18 +3704,9 @@ func (ob *mexcOrderBook) run(ctx context.Context, resyncChan chan string) {
 				// Do NOT mark the book as unsynced due to connection state changes alone
 				// The book will determine if it needs a resync based on sequence numbers when updates resume
 			} else {
-				// Connection is established, only trigger a resync if book is not synced
-				if !ob.synced.Load() {
-					ob.log.Debugf("Market connection up, scheduling resync for %s (not synced)", ob.mktSymbol)
-					select {
-					case resyncChan <- ob.mktSymbol:
-						ob.log.Debugf("Resync request sent for %s after connection restore", ob.mktSymbol)
-					default:
-						ob.log.Warnf("Resync channel full when trying to signal %s after connection restore", ob.mktSymbol)
-					}
-				} else {
-					ob.log.Debugf("Market connection up for %s, already synced - no resync needed", ob.mktSymbol)
-				}
+				// Connection is established, just log it and let the sequence numbers determine sync state
+				ob.log.Debugf("Market connection up for %s, maintaining current sync state. Sequence-based validation will determine if resync needed.", ob.mktSymbol)
+				// IMPORTANT: Do not trigger resync based on connection status alone
 			}
 		}
 	}
@@ -3809,10 +3804,12 @@ func (ob *mexcOrderBook) processUpdate(update *mexctypes.WsDepthUpdateData, resy
 	defer ob.mtx.Unlock()
 
 	if !ob.synced.Load() {
+		ob.log.Debugf("Received update for %s while not synced, dropping (update version: %d)", ob.mktSymbol, updateVersion)
 		return // Drop if not synced
 	}
 
 	if updateVersion <= ob.lastUpdateID {
+		ob.log.Tracef("Received stale/duplicate update for %s (last: %d, received: %d)", ob.mktSymbol, ob.lastUpdateID, updateVersion)
 		return // Stale or duplicate
 	}
 
@@ -3828,6 +3825,12 @@ func (ob *mexcOrderBook) processUpdate(update *mexctypes.WsDepthUpdateData, resy
 		ob.requestResync(resyncChan)
 		return
 	}
+
+	bidCount := len(bids)
+	askCount := len(asks)
+	ob.log.Debugf("Processing depth update for %s (Version: %d -> %d, Bids: %d, Asks: %d)",
+		ob.mktSymbol, ob.lastUpdateID, updateVersion, bidCount, askCount)
+
 	ob.book.update(bids, asks)
 	ob.lastUpdateID = updateVersion
 }
