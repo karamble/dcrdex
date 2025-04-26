@@ -173,7 +173,7 @@ func newMEXC(cfg *CEXConfig) (*mexc, error) {
 		tradeIDNoncePrefix: dex.Bytes(prefix),
 
 		marketSubs:          make(map[string]uint32),
-		marketSubResyncChan: make(chan string, 10),
+		marketSubResyncChan: make(chan string, 100), // Increased buffer size
 		books:               make(map[string]*mexcOrderBook),
 		tradeUpdaters:       make(map[int]chan *Trade),
 		activeTrades:        make(map[string]*mexcTradeInfo),
@@ -1957,21 +1957,47 @@ func (m *mexc) handleMarketConnectEvent(status comms.ConnectionStatus) {
 		for _, book := range m.books {
 			select {
 			case book.connectedChan <- true:
+				m.log.Debugf("Sent connected=true notification to book for %s", book.mktSymbol)
 			default:
-				m.log.Debugf("Could not send connected=true to book for %s: channel full", book.mktSymbol)
+				// If the channel is full, it means the orderbook might not be processing
+				// connection events fast enough. Clear the channel and try again.
+				for len(book.connectedChan) > 0 {
+					<-book.connectedChan // Drain the channel
+				}
+				// Now try again with the drained channel
+				select {
+				case book.connectedChan <- true:
+					m.log.Debugf("Sent connected=true notification to book for %s after draining channel", book.mktSymbol)
+				default:
+					m.log.Warnf("Could not send connected=true to book for %s: channel still full after draining", book.mktSymbol)
+				}
 			}
 		}
 		m.booksMtx.RUnlock()
 
 	case comms.Disconnected:
-		// Mark all books as unsynced when disconnected
+		// Notify books of disconnection but don't mark them as unsynced
+		// The orderbook will remain synced during disconnection and will determine
+		// if it needs a resync based on sequence numbers after reconnection
 		m.booksMtx.RLock()
 		for _, book := range m.books {
-			book.synced.Store(false)
+			// Don't mark as unsynced here - removed: book.synced.Store(false)
 			select {
 			case book.connectedChan <- false:
+				m.log.Debugf("Sent connected=false notification to book for %s", book.mktSymbol)
 			default:
-				m.log.Debugf("Could not send connected=false to book for %s: channel full", book.mktSymbol)
+				// If the channel is full, it means the orderbook might not be processing
+				// connection events fast enough. Clear the channel and try again.
+				for len(book.connectedChan) > 0 {
+					<-book.connectedChan // Drain the channel
+				}
+				// Now try again with the drained channel
+				select {
+				case book.connectedChan <- false:
+					m.log.Debugf("Sent connected=false notification to book for %s after draining channel", book.mktSymbol)
+				default:
+					m.log.Warnf("Could not send connected=false to book for %s: channel still full after draining", book.mktSymbol)
+				}
 			}
 		}
 		m.booksMtx.RUnlock()
@@ -2203,8 +2229,21 @@ func (m *mexc) resubscribeMarkets() {
 
 	// First, ensure all tracked books are marked as needing resync
 	for symbol, book := range m.books {
-		// Mark as unsynced and will force a resync via connectedChan in handleMarketConnectEvent
+		// Mark as unsynced explicitly
 		book.synced.Store(false)
+
+		// Create a new syncChan for this book to ensure anyone waiting on syncChan.Close() will be notified
+		book.mtx.Lock()
+		select {
+		case <-book.syncChan:
+			// Already closed, create a new one
+		default:
+			// Not closed, close it to notify any waiters, then create a new one
+			close(book.syncChan)
+		}
+		book.syncChan = make(chan struct{})
+		book.mtx.Unlock()
+
 		m.log.Debugf("Market %s marked for resync after reconnection", symbol)
 	}
 
@@ -2700,10 +2739,20 @@ func (m *mexc) resetListenKeyTimer() {
 
 // signalReconnect sends a non-blocking signal to the reconnect channel.
 func (m *mexc) signalReconnect() {
+	// Check if shutdown is in progress
+	select {
+	case <-m.quit:
+		m.log.Infof("[UserWS] Shutdown in progress, not signaling reconnect")
+		return
+	default:
+		// Not shutting down, continue
+	}
+
 	select {
 	case m.reconnectChan <- struct{}{}: // Signal if possible
+		m.log.Debugf("[UserWS] Sent reconnect signal")
 	default: // If channel is full, a reconnect is already pending
-		m.log.Debugf("Reconnect signal already pending for user data stream.")
+		m.log.Debugf("[UserWS] Reconnect signal already pending for user data stream.")
 	}
 }
 
@@ -2718,10 +2767,23 @@ func (m *mexc) connectUserStream(ctx context.Context) {
 	keyRefreshCtx, cancelKeyRefresh := context.WithCancel(ctx)
 	defer cancelKeyRefresh()
 
+	// Add shutdown detection
+	go func() {
+		select {
+		case <-m.quit:
+			m.log.Infof("[UserWS] Shutdown detected, canceling keyRefreshCtx")
+			cancelKeyRefresh()
+		case <-ctx.Done():
+			// Context is done, no need to do anything extra
+		}
+	}()
+
 connectLoop:
 	for {
 		select {
 		case <-ctx.Done():
+			// Drain reconnect channel to prevent reconnects during shutdown
+			m.drainReconnectChannel()
 			return
 		default:
 		}
@@ -2734,6 +2796,8 @@ connectLoop:
 			case <-time.After(reconnectInterval):
 				continue connectLoop
 			case <-ctx.Done():
+				// Drain reconnect channel to prevent reconnects during shutdown
+				m.drainReconnectChannel()
 				return
 			}
 		}
@@ -2760,6 +2824,8 @@ connectLoop:
 			case <-time.After(reconnectInterval):
 				continue connectLoop
 			case <-ctx.Done():
+				// Drain reconnect channel to prevent reconnects during shutdown
+				m.drainReconnectChannel()
 				return
 			}
 		}
@@ -2783,12 +2849,25 @@ connectLoop:
 			select {
 			case <-ctx.Done():
 				m.log.Infof("Main context canceled, shutting down user stream.")
+				// Drain reconnect channel to prevent reconnects during shutdown
+				m.drainReconnectChannel()
 				cancelKeyRefresh()
 				break wsLoop // Exit inner loop
 			case <-m.reconnectChan:
-				m.log.Warnf("Received reconnect signal for user data stream. Reconnecting...")
-				cancelKeyRefresh()
-				break wsLoop // Exit inner loop
+				// Check if we're shutting down
+				select {
+				case <-ctx.Done():
+					m.log.Infof("[UserWS] Ignoring reconnect signal during shutdown")
+					// Drain remaining reconnect signals
+					m.drainReconnectChannel()
+					cancelKeyRefresh()
+					break wsLoop // Exit inner loop
+				default:
+					// Not shutting down, proceed with reconnect
+					m.log.Warnf("Received reconnect signal for user data stream. Reconnecting...")
+					cancelKeyRefresh()
+					break wsLoop // Exit inner loop
+				}
 				/* Removed proactive PING case
 				case <-pingTicker.C:
 					// Send proactive client PING
@@ -2814,8 +2893,30 @@ connectLoop:
 		if connWg != nil {
 			connWg.Wait()
 		}
-		keyRefreshCtx, cancelKeyRefresh = context.WithCancel(ctx)
+
+		// Check for shutdown again before proceeding with reconnection
+		select {
+		case <-ctx.Done():
+			m.log.Infof("[UserWS] Context canceled after connection closed, exiting without reconnect")
+			return
+		default:
+			// Not shutting down, prepare for next connection attempt
+			keyRefreshCtx, cancelKeyRefresh = context.WithCancel(ctx)
+		}
 		// Loop continues after cleanup
+	}
+}
+
+// drainReconnectChannel drains any pending reconnect signals to prevent reconnects during shutdown.
+func (m *mexc) drainReconnectChannel() {
+	m.log.Debugf("[UserWS] Draining reconnect channel")
+	for {
+		select {
+		case <-m.reconnectChan:
+			m.log.Debugf("[UserWS] Drained reconnect signal during shutdown")
+		default:
+			return // Channel is empty
+		}
 	}
 }
 
@@ -2849,6 +2950,15 @@ func (m *mexc) handleUserConnectEvent(status comms.ConnectionStatus) {
 	// Connected events are handled by the WsConn and connectUserStream
 	// Prevent repeatedly triggering reconnects on status changes
 	if status == comms.Disconnected {
+		// Check if shutdown is in progress by checking if quit channel is closed
+		select {
+		case <-m.quit:
+			m.log.Infof("[UserWS] Disconnected during shutdown, not scheduling reconnect")
+			return // Don't reconnect during shutdown
+		default:
+			// Not shutting down, continue with normal reconnect logic
+		}
+
 		// Check if we're already in the process of reconnecting
 		select {
 		case <-m.reconnectChan: // Try to drain any existing signal
@@ -2861,14 +2971,54 @@ func (m *mexc) handleUserConnectEvent(status comms.ConnectionStatus) {
 			// Only signal reconnect if we're still disconnected after a short delay
 			// This helps avoid reconnection loops if the connection state changes rapidly
 			go func() {
-				time.Sleep(2 * time.Second)
-				// Double-check that we're still disconnected before triggering reconnect
-				if m.userDataStream != nil && m.userDataStream.IsDown() {
-					m.log.Infof("[UserWS] Still disconnected after delay, signaling reconnect")
-					m.signalReconnect()
+				// Store quit channel in local variable to ensure we're checking the same channel
+				quitChan := m.quit
+
+				// Wait with shutdown awareness
+				select {
+				case <-time.After(2 * time.Second):
+					// Check for shutdown again after delay
+					select {
+					case <-quitChan:
+						m.log.Infof("[UserWS] Shutdown detected after reconnect delay, abandoning reconnect")
+						return
+					default:
+						// Not shutting down, continue with check
+					}
+
+					// Perform one more shutdown check before proceeding
+					if m.isShuttingDown() {
+						m.log.Infof("[UserWS] Shutdown detected before reconnect, abandoning reconnect")
+						return
+					}
+
+					// Double-check that we're still disconnected before triggering reconnect
+					if m.userDataStream != nil && m.userDataStream.IsDown() {
+						m.log.Infof("[UserWS] Still disconnected after delay, signaling reconnect")
+						// Final shutdown check before signaling reconnect
+						if !m.isShuttingDown() {
+							m.signalReconnect()
+						} else {
+							m.log.Infof("[UserWS] Abandoning reconnect signal, shutdown in progress")
+						}
+					}
+				case <-quitChan:
+					// Shutdown detected during delay
+					m.log.Infof("[UserWS] Shutdown detected during reconnect delay, abandoning reconnect")
+					return
 				}
 			}()
 		}
+	}
+}
+
+// isShuttingDown is a helper to check if shutdown is in progress
+func (m *mexc) isShuttingDown() bool {
+	select {
+	case <-m.quit:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -3412,7 +3562,7 @@ func newMEXCOrderBook(
 		updateQueue:   make(chan *mexctypes.WsDepthUpdateData, 256), // Buffered queue
 		syncChan:      make(chan struct{}),                          // Unclosed initially
 		stopChan:      make(chan struct{}),                          // For stopping the run goroutine
-		connectedChan: make(chan bool),                              // Channel to communicate connection status changes
+		connectedChan: make(chan bool, 5),                           // Increased buffer size to prevent blocking
 	}
 }
 
@@ -3451,6 +3601,10 @@ func (ob *mexcOrderBook) run(ctx context.Context, resyncChan chan string) {
 		return // Give up if initial sync failed after retries
 	}
 
+	// Create a resync ticker to attempt periodic resyncs if needed
+	resyncTicker := time.NewTicker(30 * time.Second)
+	defer resyncTicker.Stop()
+
 	// Original processing loop (runs only after successful initial sync)
 	for {
 		select {
@@ -3469,23 +3623,47 @@ func (ob *mexcOrderBook) run(ctx context.Context, resyncChan chan string) {
 				ob.log.Infof("Received resync request for %s, attempting sync...", ob.mktSymbol)
 				// Attempt sync (will mark synced=true on success)
 				if !ob.syncOrderbook(ctx) {
-					ob.log.Errorf("Resync attempt failed for %s", ob.mktSymbol)
-					// Consider if we need further action on repeated failures here
+					ob.log.Errorf("Resync attempt failed for %s, will retry later", ob.mktSymbol)
 				}
 			} // Ignore requests for other symbols
+		case <-resyncTicker.C:
+			// Periodically check if we need to resync (if not already synced)
+			if !ob.synced.Load() {
+				ob.log.Infof("Periodic resync check: %s is not synced, attempting resync...", ob.mktSymbol)
+				if !ob.syncOrderbook(ctx) {
+					ob.log.Errorf("Periodic resync attempt failed for %s", ob.mktSymbol)
+				}
+			}
 		case connected := <-ob.connectedChan:
 			if !connected {
 				ob.log.Debugf("Market connection down, marking %s orderbook as unsynced", ob.mktSymbol)
 				ob.synced.Store(false)
 			} else {
 				// Connection is established, trigger a resync if book is not synced
+				// Instead of immediately sending on resyncChan (which might be full),
+				// we'll attempt the resync right here
 				if !ob.synced.Load() {
-					ob.log.Debugf("Market connection up, scheduling resync for %s", ob.mktSymbol)
-					select {
-					case resyncChan <- ob.mktSymbol:
-						ob.log.Debugf("Resync request sent for %s after connection restore", ob.mktSymbol)
-					default:
-						ob.log.Warnf("Resync channel full when trying to signal %s after connection restore", ob.mktSymbol)
+					ob.log.Debugf("Market connection up, initiating resync for %s", ob.mktSymbol)
+					if !ob.syncOrderbook(ctx) {
+						ob.log.Errorf("Resync attempt after connection restore failed for %s, will retry later", ob.mktSymbol)
+						// Schedule retry via resyncChan with delay to avoid hammering
+						go func() {
+							select {
+							case <-time.After(5 * time.Second):
+								select {
+								case resyncChan <- ob.mktSymbol:
+									ob.log.Debugf("Scheduled delayed resync for %s after failed attempt", ob.mktSymbol)
+								default:
+									ob.log.Warnf("Resync channel full when trying to schedule delayed resync for %s", ob.mktSymbol)
+								}
+							case <-ctx.Done():
+								return
+							case <-ob.stopChan:
+								return
+							}
+						}()
+					} else {
+						ob.log.Infof("Successfully resynced %s orderbook after connection restore", ob.mktSymbol)
 					}
 				}
 			}
@@ -3647,4 +3825,67 @@ func (ob *mexcOrderBook) convertDepthEntries(mexcBids, mexcAsks [][2]json.Number
 		return nil, nil, fmt.Errorf("asks: %w", err)
 	}
 	return bids, asks, nil
+}
+
+// StopTrading cleans up resources associated with trading a specific base/quote pair.
+// This should be called when the user stops the bot to ensure a clean restart with fresh orderbooks.
+func (m *mexc) StopTrading(baseID, quoteID uint32) error {
+	m.log.Infof("Stopping trading for MEXC market %d/%d", baseID, quoteID)
+
+	// 1. Map IDs to MEXC symbol
+	mexcSymbol, err := m.mapDEXIDsToMEXCSymbol(baseID, quoteID)
+	if err != nil {
+		return fmt.Errorf("cannot map DEX IDs to MEXC symbol for stop trading: %w", err)
+	}
+
+	// 2. Check if we're actually subscribed to this market
+	m.booksMtx.RLock()
+	_, exists := m.books[mexcSymbol]
+	m.booksMtx.RUnlock()
+	if !exists {
+		m.log.Warnf("Attempted to stop trading on non-subscribed market %s (%d/%d)", mexcSymbol, baseID, quoteID)
+		return nil // Not subscribed, nothing to do
+	}
+
+	// 3. Unsubscribe from the market (this handles WebSocket cleanup)
+	if err := m.UnsubscribeMarket(baseID, quoteID); err != nil {
+		m.log.Errorf("Error unsubscribing from market %s (%d/%d) during stop trading: %v",
+			mexcSymbol, baseID, quoteID, err)
+		// Continue with cleanup even if unsubscribe fails
+	}
+
+	// 4. Cleanup any active trades for this market
+	m.activeTradesMtx.Lock()
+	for tradeID, tradeInfo := range m.activeTrades {
+		if tradeInfo.baseID == baseID && tradeInfo.quoteID == quoteID {
+			delete(m.activeTrades, tradeID)
+			m.log.Debugf("Removed active trade %s for market %s from tracking during stop trading",
+				tradeID, mexcSymbol)
+		}
+	}
+	m.activeTradesMtx.Unlock()
+
+	// 5. Double-check that the book was actually removed (it should be by UnsubscribeMarket)
+	m.booksMtx.Lock()
+	if _, stillExists := m.books[mexcSymbol]; stillExists {
+		// The book is still in the map (possibly from other subscribers)
+		// Let's forcibly stop and remove it to ensure clean restart
+		book := m.books[mexcSymbol]
+		delete(m.books, mexcSymbol)
+		m.log.Warnf("Forcibly removed orderbook for %s during stop trading", mexcSymbol)
+
+		// Stop the book outside the lock
+		m.booksMtx.Unlock()
+		book.stop()
+	} else {
+		m.booksMtx.Unlock()
+	}
+
+	// 6. Clean up market subscription tracking
+	m.marketStreamMtx.Lock()
+	delete(m.marketSubs, mexcSymbol)
+	m.marketStreamMtx.Unlock()
+
+	m.log.Infof("Successfully stopped trading for MEXC market %s (%d/%d)", mexcSymbol, baseID, quoteID)
+	return nil
 }
