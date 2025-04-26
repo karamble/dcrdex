@@ -33,11 +33,15 @@ type Network struct {
 
 // DepositAddress structure for GET /api/v3/capital/deposit/address.
 type DepositAddress struct {
-	Coin    string `json:"coin"`
-	Network string `json:"network"`
-	Address string `json:"address"`
-	Tag     string `json:"tag,omitempty"` // Memo/Tag if required
-	URL     string `json:"url,omitempty"` // URL? Check API response
+	Coin             string `json:"coin"`
+	Network          string `json:"network"`
+	Address          string `json:"address"`
+	Tag              string `json:"tag,omitempty"`     // Memo/Tag if required
+	URL              string `json:"url,omitempty"`     // URL? Check API response
+	NetWork          string `json:"netWork,omitempty"` // Alternate capitalization in API
+	Memo             string `json:"memo,omitempty"`    // Alternate name for Tag
+	ChainName        string `json:"chainName,omitempty"`
+	ChainDisplayName string `json:"chainDisplayName,omitempty"`
 }
 
 // DepositHistoryRecord structure for GET /api/v3/capital/deposit/hisrec.

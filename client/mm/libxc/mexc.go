@@ -1589,25 +1589,53 @@ func (m *mexc) GetDepositAddress(ctx context.Context, assetID uint32) (string, e
 	params.Set("coin", mexcCoin)
 	params.Set("network", mexcNetwork)
 
-	// 3. Send Request
-	var resp mexctypes.DepositAddress
-	err := m.request(ctx, http.MethodGet, path, params, nil, true, &resp)
+	// 3. Send Request - MEXC API returns an array of deposit addresses
+	var respArray []mexctypes.DepositAddress
+	err := m.request(ctx, http.MethodGet, path, params, nil, true, &respArray)
 	if err != nil {
 		return "", fmt.Errorf("MEXC get deposit address request failed for %s (%s): %w", mexcCoin, mexcNetwork, err)
 	}
 
-	// 4. Return address (and handle tag)
-	if resp.Address == "" {
-		return "", fmt.Errorf("MEXC returned empty deposit address for %s (%s)", mexcCoin, mexcNetwork)
+	// 4. Check if we got any addresses in the array
+	if len(respArray) == 0 {
+		return "", fmt.Errorf("MEXC returned empty deposit address array for %s (%s)", mexcCoin, mexcNetwork)
 	}
 
-	if resp.Tag != "" {
-		m.log.Warnf("MEXC deposit address for %s (%s) requires a tag/memo: %s. Ensure user includes this.", mexcCoin, mexcNetwork, resp.Tag)
+	// Use the first address that matches our network
+	var matchingAddress *mexctypes.DepositAddress
+	for i := range respArray {
+		addr := &respArray[i]
+		// Check both "network" and "netWork" fields (MEXC API docs show inconsistent casing)
+		if addr.Network == mexcNetwork || addr.NetWork == mexcNetwork {
+			matchingAddress = addr
+			break
+		}
+	}
+
+	// If no exact network match, use the first address with a non-empty address
+	if matchingAddress == nil {
+		for i := range respArray {
+			if respArray[i].Address != "" {
+				matchingAddress = &respArray[i]
+				m.log.Warnf("No exact network match found for %s, using address with network %s",
+					mexcNetwork, matchingAddress.Network)
+				break
+			}
+		}
+	}
+
+	if matchingAddress == nil || matchingAddress.Address == "" {
+		return "", fmt.Errorf("MEXC returned no matching deposit address for %s (%s)", mexcCoin, mexcNetwork)
+	}
+
+	// Handle tag/memo if present
+	if matchingAddress.Tag != "" {
+		m.log.Warnf("MEXC deposit address for %s (%s) requires a tag/memo: %s. Ensure user includes this.", mexcCoin, mexcNetwork, matchingAddress.Tag)
 		// NOTE: Current libxc interface only returns address string.
 	}
 
 	m.log.Infof("Retrieved MEXC deposit address for %s (%s)", mexcCoin, mexcNetwork)
-	return resp.Address, nil
+	return matchingAddress.Address, nil
 }
 
 // TradeStatus retrieves the current status of an order.
@@ -1749,30 +1777,32 @@ func (m *mexc) Withdraw(ctx context.Context, assetID uint32, atoms uint64, addre
 	amountStr := strconv.FormatFloat(conventionalAmount, 'f', precision, 64)
 
 	// 3. Prepare API Request
-	path := "/api/v3/capital/withdraw/apply"
+	path := "/api/v3/capital/withdraw"
 	params := url.Values{}
 	params.Set("coin", mexcCoin)
-	params.Set("network", mexcNetwork)
+	params.Set("netWork", mexcNetwork)
 	params.Set("address", address)
 	params.Set("amount", amountStr)
 	// TODO: Add memo/tag handling if needed.
 	// Example: if tag != "" { params.Set("memo", tag) }
 
 	// 4. Send Request
-	var resp mexctypes.WithdrawApplyResponse
+	var resp struct {
+		ID string `json:"id"`
+	}
 	err = m.request(ctx, http.MethodPost, path, params, nil, true, &resp)
 	if err != nil {
 		return "", fmt.Errorf("MEXC withdraw request failed for %s (%s): %w", mexcCoin, mexcNetwork, err)
 	}
 
 	// 5. Return withdrawal ID
-	if resp.WithdrawID == "" {
+	if resp.ID == "" {
 		return "", fmt.Errorf("MEXC withdraw request succeeded but did not return a withdrawal ID")
 	}
 
 	m.log.Infof("Successfully initiated MEXC withdrawal for %s (%s), Amount: %s. Withdrawal ID: %s",
-		mexcCoin, mexcNetwork, amountStr, resp.WithdrawID)
-	return resp.WithdrawID, nil
+		mexcCoin, mexcNetwork, amountStr, resp.ID)
+	return resp.ID, nil
 }
 
 // UnsubscribeMarket unsubscribes from order book updates.
@@ -1952,11 +1982,29 @@ func (m *mexc) handleMarketConnectEvent(status comms.ConnectionStatus) {
 func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol string) error {
 	m.log.Infof("[MarketWS] Subscribing to additional market: %s", mexcSymbol)
 
+	// First check if we already have an active subscription for this symbol
+	m.marketStreamMtx.Lock()
+	currentSubs, exists := m.marketSubs[mexcSymbol]
+	if exists && currentSubs > 0 {
+		// We already have an active subscription, just increment the counter
+		m.marketSubs[mexcSymbol]++
+		subCount := m.marketSubs[mexcSymbol]
+		m.marketStreamMtx.Unlock()
+		m.log.Infof("[MarketWS] Already subscribed to %s, incremented count to %d", mexcSymbol, subCount)
+		return nil
+	}
+
+	// No active subscription yet, create a new one
 	if m.marketStream == nil || m.marketStream.IsDown() {
+		m.marketStreamMtx.Unlock()
 		// This check is slightly redundant if caller holds lock and checks,
 		// but provides safety if called incorrectly.
 		return fmt.Errorf("market stream not connected when trying to subscribe to %s", mexcSymbol)
 	}
+
+	// Increment subscription count before sending request
+	m.marketSubs[mexcSymbol] = 1
+	m.marketStreamMtx.Unlock()
 
 	channel := fmt.Sprintf("spot@public.increase.depth.v3.api@%s", mexcSymbol)
 	req := mexctypes.WsRequest{
@@ -1965,18 +2013,26 @@ func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol strin
 	}
 	reqBytes, marshalErr := json.Marshal(req)
 	if marshalErr != nil {
+		// Clean up subscription tracking if we failed
+		m.marketStreamMtx.Lock()
+		delete(m.marketSubs, mexcSymbol)
+		m.marketStreamMtx.Unlock()
 		return fmt.Errorf("failed to marshal market subscription request for %s: %w", mexcSymbol, marshalErr)
 	}
 
 	m.log.Debugf("[MarketWS] Sending SUBSCRIPTION for %s", mexcSymbol)
 	err := m.marketStream.SendRaw(reqBytes)
 	if err != nil {
+		// Clean up subscription tracking if we failed
+		m.marketStreamMtx.Lock()
+		delete(m.marketSubs, mexcSymbol)
+		m.marketStreamMtx.Unlock()
 		// Log the error, WsConn might handle reconnect, but the sub likely failed for now.
 		m.log.Errorf("Failed to send market subscription for %s: %v", mexcSymbol, err)
 		return fmt.Errorf("failed to send market subscription for %s: %w", mexcSymbol, err)
 	}
 
-	m.log.Infof("[MarketWS] Sent subscription request for additional market %s", mexcSymbol)
+	m.log.Infof("[MarketWS] Sent subscription request for market %s", mexcSymbol)
 	return nil
 }
 
@@ -2019,11 +2075,108 @@ func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 		Msg  string      `json:"msg"`
 	}
 	if err := json.Unmarshal(msgBytes, &genericResp); err == nil {
-		// Check for subscription success confirmations (Code 0 and Msg contains channel name)
-		if genericResp.Code == 0 && strings.Contains(genericResp.Msg, "spot@public.increase.depth.v3.api") {
-			m.log.Debugf("[MarketWS] Received MEXC WS Success Subscription Confirmation: %s", string(msgBytes))
-			return // Handled success confirmation
+		// Check for subscription responses
+		if strings.Contains(genericResp.Msg, "spot@public.increase.depth.v3.api") {
+			// Extract the symbol from the message
+			// Format is usually "Not Subscribed successfully! [spot@public.increase.depth.v3.api@SYMBOL]..."
+			channelStart := strings.Index(genericResp.Msg, "[")
+			channelEnd := strings.Index(genericResp.Msg, "]")
+
+			if channelStart >= 0 && channelEnd > channelStart {
+				channel := genericResp.Msg[channelStart+1 : channelEnd]
+
+				// Extract the symbol from the channel string
+				parts := strings.Split(channel, "@")
+				if len(parts) >= 4 {
+					symbol := parts[3]
+
+					// Check if it's a subscription error due to limit
+					if strings.Contains(genericResp.Msg, "Exceeded maximum subscription limit") {
+						m.log.Warnf("[MarketWS] Subscription limit exceeded for %s, will unsubscribe and retry", symbol)
+
+						// Unsubscribe to clear any existing subscriptions on the MEXC side
+						unsubReq := mexctypes.WsRequest{
+							Method: "UNSUBSCRIPTION",
+							Params: []string{channel},
+						}
+
+						unsubBytes, err := json.Marshal(unsubReq)
+						if err == nil {
+							if err := m.marketStream.SendRaw(unsubBytes); err != nil {
+								m.log.Errorf("[MarketWS] Failed to send unsubscription for %s: %v", symbol, err)
+							} else {
+								m.log.Debugf("[MarketWS] Sent unsubscription for %s to clear limit", symbol)
+							}
+
+							// Reset our subscription tracking
+							m.marketStreamMtx.Lock()
+							delete(m.marketSubs, symbol)
+							m.marketStreamMtx.Unlock()
+
+							// Add a delay to avoid rate limiting
+							time.Sleep(500 * time.Millisecond)
+
+							// Try to resubscribe - we can't do this here directly, so schedule it
+							go func(sym string) {
+								// Wait a bit before resubscribing
+								time.Sleep(2 * time.Second)
+
+								// Resubscribe with only one subscription
+								channel := fmt.Sprintf("spot@public.increase.depth.v3.api@%s", sym)
+								req := mexctypes.WsRequest{
+									Method: "SUBSCRIPTION",
+									Params: []string{channel},
+								}
+
+								// Update subscription tracking
+								m.marketStreamMtx.Lock()
+								if _, exists := m.marketSubs[sym]; !exists {
+									m.marketSubs[sym] = 1
+									m.marketStreamMtx.Unlock()
+
+									reqBytes, marshalErr := json.Marshal(req)
+									if marshalErr != nil {
+										m.log.Errorf("[MarketWS] Failed to marshal resubscription for %s: %v", sym, marshalErr)
+										return
+									}
+
+									if err := m.marketStream.SendRaw(reqBytes); err != nil {
+										m.log.Errorf("[MarketWS] Failed to send resubscription for %s: %v", sym, err)
+
+										// Clean up on failure
+										m.marketStreamMtx.Lock()
+										delete(m.marketSubs, sym)
+										m.marketStreamMtx.Unlock()
+									} else {
+										m.log.Infof("[MarketWS] Resubscribed to %s after clearing limit", sym)
+									}
+								} else {
+									m.marketStreamMtx.Unlock()
+									m.log.Debugf("[MarketWS] Already resubscribed to %s, skipping", sym)
+								}
+							}(symbol)
+						}
+
+						return
+					} else if strings.Contains(genericResp.Msg, "Subscribed successfully") {
+						m.log.Infof("[MarketWS] Successfully subscribed to %s", symbol)
+						return
+					} else if strings.Contains(genericResp.Msg, "Not Subscribed successfully") {
+						m.log.Warnf("[MarketWS] Failed to subscribe to %s: %s", symbol, genericResp.Msg)
+
+						// Clean up our subscription tracking
+						m.marketStreamMtx.Lock()
+						delete(m.marketSubs, symbol)
+						m.marketStreamMtx.Unlock()
+						return
+					}
+				}
+			}
+
+			m.log.Debugf("[MarketWS] Received MEXC WS subscription message: %s", string(msgBytes))
+			return
 		}
+
 		// Log PONG or anything else structured but not recognized
 		m.log.Warnf("[MarketWS] Received unknown structured WS message: %s", string(msgBytes))
 		return
@@ -2055,8 +2208,33 @@ func (m *mexc) resubscribeMarkets() {
 		m.log.Debugf("Market %s marked for resync after reconnection", symbol)
 	}
 
+	// Before we send new subscription requests, clear the subscription tracking
+	// to avoid the "Exceeded maximum subscription limit" error
+	m.marketStreamMtx.Lock()
+	// Reset subscription tracking map to avoid duplicate subscriptions
+	for symbol := range m.marketSubs {
+		m.marketSubs[symbol] = 0
+	}
+	m.marketStreamMtx.Unlock()
+
 	// Now resubscribe each market to the websocket feed
+	alreadySubscribed := make(map[string]bool)
+
 	for symbol := range m.books {
+		// Skip if we've already sent a subscription for this symbol
+		if alreadySubscribed[symbol] {
+			m.log.Debugf("[Resubscribe] Skipping duplicate subscription for %s", symbol)
+			continue
+		}
+
+		// Mark this symbol as subscribed to avoid duplicate subscription requests
+		alreadySubscribed[symbol] = true
+
+		// Update subscription count
+		m.marketStreamMtx.Lock()
+		m.marketSubs[symbol] = 1 // Reset to 1 subscriber
+		m.marketStreamMtx.Unlock()
+
 		// Reuse SubscribeMarket logic without locking/book creation
 		channel := fmt.Sprintf("spot@public.increase.depth.v3.api@%s", symbol)
 		req := mexctypes.WsRequest{
@@ -2071,6 +2249,11 @@ func (m *mexc) resubscribeMarkets() {
 		// Use SendRaw
 		if err := m.marketStream.SendRaw(reqBytes); err != nil {
 			m.log.Errorf("[Resubscribe] Failed to send subscription for %s: %v", symbol, err)
+
+			// Remove from subscription tracking if failed
+			m.marketStreamMtx.Lock()
+			delete(m.marketSubs, symbol)
+			m.marketStreamMtx.Unlock()
 		} else {
 			m.log.Debugf("[Resubscribe] Successfully resubscribed to %s", symbol)
 		}
