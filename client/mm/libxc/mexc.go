@@ -235,7 +235,8 @@ func newMEXC(cfg *CEXConfig) (*mexc, error) {
 	marketWsCfg.Logger = marketLogger // Assign market logger
 	marketWsCfg.URL = mexcWsURL
 	marketWsCfg.RawHandler = m.handleMarketRawMessage // Assign market raw handler
-	marketWsCfg.ReconnectSync = m.resubscribeMarkets
+	// Don't auto-resubscribe on reconnection - let the markets maintain their state
+	marketWsCfg.ReconnectSync = nil // MEXC maintains subscriptions, no need to resubscribe on reconnect
 	marketWsCfg.ConnectEventFunc = m.handleMarketConnectEvent
 	marketWsCfg.PingWait = 120 * time.Second // Decreased PingWait for market stream
 	marketStream, err := comms.NewWsConn(&marketWsCfg)
@@ -1884,7 +1885,9 @@ func (m *mexc) connectMarketStream(ctx context.Context, firstMexcSymbol string) 
 		marketLogger := m.log.SubLogger("MarketWS")
 		marketWsCfg := &comms.WsCfg{
 			Logger: marketLogger, URL: mexcWsURL, PingWait: 75 * time.Second,
-			RawHandler: m.handleMarketRawMessage, ReconnectSync: m.resubscribeMarkets,
+			RawHandler: m.handleMarketRawMessage,
+			// Don't auto-resubscribe on reconnection - let the markets maintain their state
+			ReconnectSync:    nil, // MEXC maintains subscriptions, no need to resubscribe on reconnect
 			ConnectEventFunc: m.handleMarketConnectEvent, EchoPingData: true,
 		}
 		conn, err := comms.NewWsConn(marketWsCfg) // Declare err here
@@ -2274,24 +2277,27 @@ func (m *mexc) resubscribeMarkets() {
 	}
 	m.log.Infof("Resubscribing to %d markets after reconnect...", len(m.books))
 
-	// First, ensure all tracked books are marked as needing resync
+	// First, ensure sync channels are properly set up for tracking
 	for symbol, book := range m.books {
-		// Mark as unsynced explicitly
-		book.synced.Store(false)
+		// DO NOT mark as unsynced explicitly - maintain current sync state
+		// book.synced.Store(false) - REMOVED
 
-		// Create a new syncChan for this book to ensure anyone waiting on syncChan.Close() will be notified
-		book.mtx.Lock()
-		select {
-		case <-book.syncChan:
-			// Already closed, create a new one
-		default:
-			// Not closed, close it to notify any waiters, then create a new one
-			close(book.syncChan)
+		// Create a new syncChan for this book ONLY if not already synced
+		// to ensure anyone waiting on syncChan.Close() will be notified
+		if !book.synced.Load() {
+			book.mtx.Lock()
+			select {
+			case <-book.syncChan:
+				// Already closed, create a new one
+			default:
+				// Not closed, close it to notify any waiters, then create a new one
+				close(book.syncChan)
+			}
+			book.syncChan = make(chan struct{})
+			book.mtx.Unlock()
 		}
-		book.syncChan = make(chan struct{})
-		book.mtx.Unlock()
 
-		m.log.Debugf("Market %s marked for resync after reconnection", symbol)
+		m.log.Debugf("Market %s marked for connection restore after reconnection", symbol)
 	}
 
 	// Before we send new subscription requests, clear the subscription tracking
@@ -3694,15 +3700,17 @@ func (ob *mexcOrderBook) run(ctx context.Context, resyncChan chan string) {
 				// Do NOT mark the book as unsynced due to connection state changes alone
 				// The book will determine if it needs a resync based on sequence numbers when updates resume
 			} else {
-				// Connection is established, trigger a resync if book is not synced
+				// Connection is established, only trigger a resync if book is not synced
 				if !ob.synced.Load() {
-					ob.log.Debugf("Market connection up, scheduling resync for %s", ob.mktSymbol)
+					ob.log.Debugf("Market connection up, scheduling resync for %s (not synced)", ob.mktSymbol)
 					select {
 					case resyncChan <- ob.mktSymbol:
 						ob.log.Debugf("Resync request sent for %s after connection restore", ob.mktSymbol)
 					default:
 						ob.log.Warnf("Resync channel full when trying to signal %s after connection restore", ob.mktSymbol)
 					}
+				} else {
+					ob.log.Debugf("Market connection up for %s, already synced - no resync needed", ob.mktSymbol)
 				}
 			}
 		}
