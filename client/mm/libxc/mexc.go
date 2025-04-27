@@ -106,6 +106,8 @@ type mexc struct {
 	listenKeyRefresh   *time.Timer   // Timer for next keepalive
 	listenKeyRequested atomic.Bool   // Prevent concurrent getListenKey calls
 	reconnectChan      chan struct{} // Signals need to reconnect user data stream
+	userSubStatus      bool          // Tracks if user data stream is subscribed
+	userSubStatusMtx   sync.RWMutex  // Mutex for userSubStatus
 
 	// Order Book Management
 	books    map[string]*mexcOrderBook // key: MEXC market symbol (e.g. BTCUSDT)
@@ -181,6 +183,7 @@ func newMEXC(cfg *CEXConfig) (*mexc, error) {
 		tradeUpdaters:       make(map[int]chan *Trade),
 		activeTrades:        make(map[string]*mexcTradeInfo),
 		reconnectChan:       make(chan struct{}, 1),
+		userSubStatus:       false, // Initialize user subscription status as false
 	}
 	// Add log check right after logger assignment
 	// m.log.Debugf("Logger check inside newMEXC - This should appear if debug is set.")
@@ -932,7 +935,7 @@ func (m *mexc) mapMEXCSymbolToDEXIDs(mexcSymbol string) (baseIDs, quoteIDs []uin
 	quoteIDs, quoteOK := m.coinToAssetIDs[quoteAsset]
 
 	if !baseOK || !quoteOK || len(baseIDs) == 0 || len(quoteIDs) == 0 {
-		return nil, nil, fmt.Errorf("could not map base (%s) or quote (%s) for MEXC symbol %q to DEX asset ID", baseAsset, quoteAsset, mexcSymbol)
+		return nil, nil, fmt.Errorf("could not map base (%s) or quote (%s) for MEXC symbol %q to DEX asset ID", baseAsset, quoteAsset, mexcSymbol, mexcSymbol)
 	}
 
 	return baseIDs, quoteIDs, nil
@@ -2013,7 +2016,11 @@ func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol strin
 // handleMarketRawMessage parses raw byte messages from the WebSocket.
 func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 	// Try to unmarshal as the base message type first
-	var baseMsg mexctypes.WsMessage
+	var baseMsg struct {
+		Ping    int64           `json:"ping,omitempty"` // Ping timestamp
+		Channel string          `json:"c,omitempty"`    // Channel name (c tag)
+		Data    json.RawMessage `json:"d,omitempty"`    // Data payload (d tag)
+	}
 	if err := json.Unmarshal(msgBytes, &baseMsg); err != nil {
 		m.log.Errorf("[MarketWS] Failed to unmarshal base market WS message: %v, msg: %s", err, string(msgBytes))
 		return
@@ -2031,15 +2038,17 @@ func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 	}
 
 	// Dispatch based on known channels
-	// Check for prefix instead of exact match, as channel includes symbol
-	switch {
-	case strings.HasPrefix(baseMsg.Channel, "spot@public.increase.depth.v3.api"):
-		if len(baseMsg.Data) == 0 || string(baseMsg.Data) == "null" {
-			m.log.Warnf("[MarketWS] Received depth update message with missing/null data field: %s", string(msgBytes))
-			return
+	if baseMsg.Channel != "" {
+		// Using Channel field with JSON tag "c"
+		channel := baseMsg.Channel
+		if strings.HasPrefix(channel, "spot@public.increase.depth.v3.api") {
+			if len(baseMsg.Data) == 0 || string(baseMsg.Data) == "null" {
+				m.log.Warnf("[MarketWS] Received depth update message with missing/null data field: %s", string(msgBytes))
+				return
+			}
+			m.handleDepthUpdate(baseMsg.Channel, baseMsg.Data)
+			return // Handled depth update
 		}
-		m.handleDepthUpdate(&baseMsg)
-		return // Handled depth update
 	}
 
 	// If Channel is empty or not recognized, try parsing as a generic response
@@ -2095,9 +2104,40 @@ func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 	m.log.Warnf("[MarketWS] Received unhandled/unparseable raw market message: %s", string(msgBytes))
 }
 
-// handleDepthUpdate parses the data part of the depth update and forwards it.
-func (m *mexc) handleDepthUpdate(msg *mexctypes.WsMessage) {
-	// ... function body ...
+// handleDepthUpdate processes a depth update message and forwards it to the appropriate order book.
+func (m *mexc) handleDepthUpdate(channel string, data json.RawMessage) {
+	// Parse the data field to get the depth update
+	var update mexctypes.WsDepthUpdateData
+	if err := json.Unmarshal(data, &update); err != nil {
+		m.log.Errorf("[MarketWS] Failed to unmarshal depth update data: %v", err)
+		return
+	}
+
+	// Extract market symbol from the channel
+	parts := strings.Split(channel, "@")
+	if len(parts) < 2 {
+		m.log.Errorf("[MarketWS] Invalid channel format for depth update: %s", channel)
+		return
+	}
+	symbol := parts[len(parts)-1]
+
+	// Forward to the order book if it exists
+	m.booksMtx.RLock()
+	book, exists := m.books[symbol]
+	m.booksMtx.RUnlock()
+
+	if !exists {
+		// m.log.Debugf("[MarketWS] Received depth update for unsubscribed market %s", symbol)
+		return
+	}
+
+	// Send to the update queue for processing
+	select {
+	case book.updateQueue <- &update:
+		// Successfully sent update to processing queue
+	default:
+		m.log.Warnf("[MarketWS] Depth update queue full for %s, dropping update", symbol)
+	}
 }
 
 // resubscribeMarkets sends subscription messages for all currently tracked markets.
@@ -2664,77 +2704,85 @@ connectLoop:
 		// Add a small delay before sending subscriptions
 		time.Sleep(1 * time.Second)
 
-		// Explicit subscriptions likely not needed for MEXC user stream
-		m.log.Infof("MEXC User Stream does not require explicit channel subscriptions.")
+		// Reset subscription status on new connection
+		m.userSubStatusMtx.Lock()
+		m.userSubStatus = false
+		m.userSubStatusMtx.Unlock()
 
-		// Rely on WsConn PingWait and EchoPingData for keepalive.
-
-		// Removed proactive PING ticker
-		// pingInterval := 25 * time.Second
-		// pingTicker := time.NewTicker(pingInterval)
-		// defer pingTicker.Stop()
-
-	wsLoop: // Label for the select loop
-		for {
+		// Subscribe to account updates with Protocol Buffers format
+		// Use "spot@private.account.v3.api" as mentioned in MEXC docs
+		subErr := m.subscribeToUserStream(ctx, "spot@private.account.v3.api")
+		if subErr != nil {
+			m.log.Errorf("Failed to subscribe to user data stream: %v. Reconnecting...", subErr)
+			// Close connection and retry
+			cancelKeyRefresh()
+			keyRefreshWg.Wait()
+			keyRefreshCtx, cancelKeyRefresh = context.WithCancel(ctx)
 			select {
+			case <-time.After(reconnectInterval):
+				continue connectLoop
 			case <-ctx.Done():
-				m.log.Infof("Main context canceled, shutting down user stream.")
-				cancelKeyRefresh()
-				break wsLoop // Exit inner loop
-			case <-m.reconnectChan:
-				m.log.Warnf("Received reconnect signal for user data stream. Reconnecting...")
-				cancelKeyRefresh()
-				break wsLoop // Exit inner loop
-				/* Removed proactive PING case
-				case <-pingTicker.C:
-					// Send proactive client PING
-					if !m.userDataStream.IsDown() {
-						m.log.Tracef("[UserWS] Sending proactive PING")
-						// Use same format as server PING for potential compatibility
-						pingMsg := mexctypes.WsMessage{Ping: time.Now().UnixMilli()}
-						pingBytes, err := json.Marshal(pingMsg)
-						if err != nil {
-							m.log.Errorf("[UserWS] Failed to marshal proactive PING: %v", err)
-							continue
-						}
-						if err := m.userDataStream.SendRaw(pingBytes); err != nil {
-							m.log.Errorf("[UserWS] Failed to send proactive PING: %v", err)
-							// Don't necessarily break loop on send failure, WsConn might recover
-						}
-					}
-				*/
+				return
 			}
 		}
 
-		keyRefreshWg.Wait()
-		if connWg != nil {
-			connWg.Wait()
+		// Rely on WsConn PingWait and EchoPingData for keepalive.
+
+		// Wait for reconnect signal or context cancellation
+		select {
+		case <-m.reconnectChan:
+			m.log.Infof("Received reconnect signal for user data stream. Reconnecting...")
+			// Reset subscription status on reconnect
+			m.userSubStatusMtx.Lock()
+			m.userSubStatus = false
+			m.userSubStatusMtx.Unlock()
+
+			cancelKeyRefresh()
+			keyRefreshWg.Wait()
+			if connWg != nil {
+				connWg.Wait() // Wait for the underlying connection's goroutines to finish
+			}
+			keyRefreshCtx, cancelKeyRefresh = context.WithCancel(ctx)
+			continue connectLoop
+		case <-ctx.Done():
+			return
 		}
-		keyRefreshCtx, cancelKeyRefresh = context.WithCancel(ctx)
-		// Loop continues after cleanup
 	}
 }
 
-// listenKeyMaintainer waits for the context to cancel and cleans up the listen key.
+// listenKeyMaintainer keeps the listen key alive by periodically refreshing it.
 func (m *mexc) listenKeyMaintainer(ctx context.Context) {
-	m.log.Infof("[UserWS] Starting listen key maintainer (HTTP keepalive timer managed separately).")
-	defer m.log.Infof("[UserWS] Stopping listen key maintainer.")
+	m.log.Infof("ENTER listenKeyMaintainer: Starting listen key maintenance...")
+	defer m.log.Infof("EXIT listenKeyMaintainer")
 
-	// The keepalive logic is handled by the time.AfterFunc timer in resetListenKeyTimer
-	// which calls keepAliveListenKey. This goroutine just needs to wait for shutdown.
-	<-ctx.Done()
+	// MEXC documentation recommends extending the listen key every 30 minutes,
+	// so we'll refresh it every 25 minutes to be safe.
+	ticker := time.NewTicker(25 * time.Minute)
+	defer ticker.Stop()
 
-	// Stop the timer on shutdown
-	m.listenKeyMtx.Lock()
-	if m.listenKeyRefresh != nil {
-		m.listenKeyRefresh.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			m.log.Debugf("Refreshing MEXC listen key...")
+
+			if err := m.keepAliveListenKey(ctx); err != nil {
+				m.log.Errorf("Failed to refresh listen key: %v. Triggering reconnect...", err)
+				// Trigger reconnect
+				select {
+				case m.reconnectChan <- struct{}{}:
+					m.log.Debugf("Triggered reconnect due to listen key refresh failure")
+				default:
+					m.log.Debugf("Reconnect already queued")
+				}
+				return
+			}
+			m.log.Debugf("Successfully refreshed MEXC listen key")
+
+		case <-ctx.Done():
+			m.log.Debugf("Context cancelled, stopping listen key maintenance")
+			return
+		}
 	}
-	m.listenKeyMtx.Unlock()
-
-	// Attempt to delete the key on clean shutdown
-	delCtx, cancelDel := context.WithTimeout(context.Background(), 10*time.Second)
-	m.deleteListenKey(delCtx)
-	cancelDel()
 }
 
 // handleUserConnectEvent handles connection status changes for the user stream.
@@ -2768,46 +2816,105 @@ func (m *mexc) handleUserConnectEvent(status comms.ConnectionStatus) {
 	}
 }
 
-// handleUserDataRawMessage parses raw byte messages from the User Data Stream.
-func (m *mexc) handleUserDataRawMessage(msgBytes []byte) {
-	// m.log.Tracef("[UserWS] Raw message: %s", string(msgBytes))
+// handleUserDataRawMessage parses raw byte messages from user data websocket.
+func (m *mexc) handleUserDataRawMessage(res []byte) {
+	if len(res) == 0 {
+		m.log.Warnf("[UserWS] Received empty message")
+		return
+	}
 
-	// REMOVED: Explicit server PING handling. Relying on WsConn EchoPingData.
-	// var pingCheck struct { Ping int64 `json:"ping"` }
-	// if err := json.Unmarshal(msgBytes, &pingCheck); err == nil && pingCheck.Ping > 0 { ... }
-
-	// Try to unmarshal into the base event type to get the event string 'e'
-	var baseEvent mexctypes.WsMessage // Reusing this struct for EventType ('e') field
-	err := json.Unmarshal(msgBytes, &baseEvent)
-	if err != nil {
-		// Check if it's the PONG ack to our (now removed) client PING
-		var pongAckCheck struct {
-			Msg string `json:"msg"`
+	// Check for ping/pong
+	if string(res) == `{"type":"ping"}` {
+		m.log.Debugf("[UserWS] Received PING, sending PONG")
+		pongMsg := `{"type":"pong"}`
+		if err := m.userDataStream.SendRaw([]byte(pongMsg)); err != nil {
+			m.log.Errorf("[UserWS] Failed to send PONG response: %v", err)
 		}
-		if json.Unmarshal(msgBytes, &pongAckCheck) == nil && pongAckCheck.Msg == "PONG" {
-			m.log.Tracef("[UserWS] Received PONG acknowledgement message (ignoring).")
+		return
+	}
+
+	// Handle ping variant in the MEXC docs
+	var pingMsg mexctypes.WsMessage
+	if err := json.Unmarshal(res, &pingMsg); err == nil && pingMsg.Ping > 0 {
+		m.log.Debugf("[UserWS] Received numbered PING %d, sending PONG", pingMsg.Ping)
+		pongMsg := mexctypes.WsPong{Pong: pingMsg.Ping}
+		pongBytes, err := json.Marshal(pongMsg)
+		if err != nil {
+			m.log.Errorf("[UserWS] Failed to marshal PONG response: %v", err)
 			return
 		}
-		m.log.Errorf("[UserWS] Failed to unmarshal base user event: %v, payload: %s", err, string(msgBytes))
+		if err := m.userDataStream.SendRaw(pongBytes); err != nil {
+			m.log.Errorf("[UserWS] Failed to send PONG response: %v", err)
+		}
 		return
 	}
 
-	if baseEvent.EventType == "" {
-		m.log.Tracef("[UserWS] Received user data message without event type: %s", string(msgBytes))
+	// Check for subscription response
+	var subResp mexctypes.WsSubResponse
+	if err := json.Unmarshal(res, &subResp); err == nil {
+		if subResp.ID != 0 {
+			m.log.Infof("[UserWS] Received subscription response: %+v", subResp)
+			if subResp.Result != nil && *subResp.Result {
+				m.log.Infof("[UserWS] Subscription successful")
+				m.userSubStatusMtx.Lock()
+				m.userSubStatus = true
+				m.userSubStatusMtx.Unlock()
+			} else {
+				m.log.Errorf("[UserWS] Subscription failed: %+v", subResp)
+				m.userSubStatusMtx.Lock()
+				m.userSubStatus = false
+				m.userSubStatusMtx.Unlock()
+				// Trigger reconnect for failed subscription
+				select {
+				case m.reconnectChan <- struct{}{}:
+					m.log.Debugf("[UserWS] Triggered reconnect due to subscription failure")
+				default:
+					m.log.Debugf("[UserWS] Reconnect already queued")
+				}
+			}
+			return
+		}
+	}
+
+	// Handle protocol buffer encoded messages (spot@private.account.v3.api.pb)
+	// This is indicated in MEXC docs for account updates
+	// Check for PB format - starts with specific bytes or magic number
+	if len(res) > 4 && res[0] == '{' {
+		var pbWrapper mexctypes.WsPBWrapper
+		if err := json.Unmarshal(res, &pbWrapper); err == nil && pbWrapper.Topic != "" {
+			m.log.Debugf("[UserWS] Received user data message with topic: %s", pbWrapper.Topic)
+
+			switch pbWrapper.Topic {
+			case "spot@private.account.v3.api":
+				if len(pbWrapper.Data) > 0 {
+					m.log.Debugf("[UserWS] Processing account update (size: %d bytes)", len(pbWrapper.Data))
+					// Let's log at least the beginning for debugging
+					if len(pbWrapper.Data) > 20 {
+						m.log.Debugf("[UserWS] Data preview: %x...", pbWrapper.Data[:20])
+					} else {
+						m.log.Debugf("[UserWS] Data: %x", pbWrapper.Data)
+					}
+
+					// Here we can process the protocol buffer data
+					// For this implementation, we'll add detailed logging for debugging
+					// In a future PR, actual PB decoding will be added
+				}
+			default:
+				m.log.Warnf("[UserWS] Unhandled topic: %s", pbWrapper.Topic)
+			}
+			return
+		}
+	}
+
+	// Default structured message processing
+	var msg mexctypes.WsMessage
+	if err := json.Unmarshal(res, &msg); err != nil {
+		m.log.Errorf("[UserWS] Failed to unmarshal message: %v, raw: %s", err, string(res))
 		return
 	}
 
-	// Dispatch based on event type ('e')
-	switch baseEvent.EventType {
-	case "spot@private.orders.v3.api": // Order updates
-		m.handleOrderUpdate(msgBytes)
-	case "spot@private.deals.v3.api": // Trade execution updates
-		m.handleDealUpdate(msgBytes)
-	case "spot@private.account.v3.api": // Balance updates
-		m.handleBalanceUpdate(msgBytes)
-	default:
-		m.log.Warnf("[UserWS] Received unhandled user data event type '%s': %s", baseEvent.EventType, string(msgBytes))
-	}
+	// No valid message structure detected
+	m.log.Warnf("[UserWS] Unhandled message format: %s", string(res))
 }
 
 // handleOrderUpdate processes order update messages.
@@ -3543,4 +3650,365 @@ func (ob *mexcOrderBook) convertDepthEntries(mexcBids, mexcAsks [][2]json.Number
 		return nil, nil, fmt.Errorf("asks: %w", err)
 	}
 	return bids, asks, nil
+}
+
+// subscribeToUserStream sends a subscription request for the user data stream
+// with Protocol Buffers format.
+func (m *mexc) subscribeToUserStream(ctx context.Context, channel string) error {
+	// Docs reference: https://mxcdevelop.github.io/apidocs/spot_v3_en/#private-account-updates-spot-private-account-v3-api
+
+	// Prepare the WebSocket subscription message
+	// MEXC API expects a subscription message with "method" and "params"
+	wsReq := mexctypes.WsRequest{
+		Method: "SUBSCRIPTION",
+		Params: []string{channel}, // Use the channel parameter
+	}
+
+	// Marshal the request to JSON
+	reqBytes, err := json.Marshal(wsReq)
+	if err != nil {
+		return fmt.Errorf("error marshaling subscription request: %v", err)
+	}
+
+	// Send the subscription request
+	m.log.Infof("[UserWS] Subscribing to %s", channel)
+	if err := m.userDataStream.SendRaw(reqBytes); err != nil {
+		return fmt.Errorf("failed to send subscription request for %s: %v", channel, err)
+	}
+
+	// Set subscription status to pending until we receive a confirmation
+	m.userSubStatusMtx.Lock()
+	m.userSubStatus = false
+	m.userSubStatusMtx.Unlock()
+
+	// Wait for subscription to be confirmed in handleUserDataRawMessage
+	// The subscription response will be handled asynchronously
+
+	return nil
+}
+
+// userDataStreamConn manages the user data stream WebSocket connection.
+func (m *mexc) userDataStreamConn(ctx context.Context) {
+	m.log.Infof("ENTER userDataStreamConn: Starting user data stream connection...")
+	defer m.log.Infof("EXIT userDataStreamConn")
+
+	// Create a wait group for the listen key refresh goroutine
+	var keyRefreshWg sync.WaitGroup
+	keyRefreshCtx, cancelKeyRefresh := context.WithCancel(ctx)
+	defer cancelKeyRefresh() // Ensure the goroutine is stopped when this function exits
+
+	const (
+		reconnectInterval = 2 * time.Second  // Wait time before reconnecting after error
+		connectTimeout    = 10 * time.Second // Timeout for initial connection
+	)
+
+connectLoop:
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Get a new listen key before connecting
+		listenKey, err := m.getListenKey(ctx)
+		if err != nil {
+			m.log.Errorf("Failed to get listen key: %v. Retrying in %v...", err, reconnectInterval)
+			// Check context before sleeping
+			select {
+			case <-time.After(reconnectInterval):
+				continue connectLoop
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		// Store the listen key
+		m.listenKeyMtx.Lock()
+		m.listenKey.Store(listenKey)
+		m.listenKeyMtx.Unlock()
+
+		// Create WebSocket connection with the listen key
+		wsURL := fmt.Sprintf("%s?listenKey=%s", mexcWsURL, listenKey)
+		m.log.Infof("Connecting to MEXC user data stream at %s", wsURL)
+
+		// Create a new WsCfg with our handler function
+		userWsCfg := &comms.WsCfg{
+			Logger:               m.cfg.Logger.SubLogger("UserWS"),
+			URL:                  wsURL,
+			PingWait:             120 * time.Second,
+			RawHandler:           m.handleUserDataMessage,
+			ConnectEventFunc:     m.handleUserConnectEvent,
+			EchoPingData:         true,
+			DisableAutoReconnect: false,
+		}
+
+		// Create a new WsConn with our updated config
+		userConn, err := comms.NewWsConn(userWsCfg)
+		if err != nil {
+			m.log.Errorf("Failed to create user data WebSocket connection: %v. Retrying in %v...", err, reconnectInterval)
+			select {
+			case <-time.After(reconnectInterval):
+				continue connectLoop
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		// Store the connection
+		m.userDataStreamMtx.Lock()
+		m.userDataStream = userConn
+		m.userDataStreamMtx.Unlock()
+
+		// Connect with timeout
+		connectCtx, connectCancel := context.WithTimeout(ctx, connectTimeout)
+		_, connErr := userConn.Connect(connectCtx)
+		connectCancel()
+
+		if connErr != nil {
+			m.log.Errorf("Failed to connect to MEXC user data stream: %v. Retrying in %v...", connErr, reconnectInterval)
+			select {
+			case <-time.After(reconnectInterval):
+				continue connectLoop
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		m.log.Infof("Connected to MEXC user data stream")
+
+		// Start the listen key maintenance goroutine
+		keyRefreshWg.Add(1)
+		go func() {
+			defer keyRefreshWg.Done()
+			m.listenKeyMaintainer(keyRefreshCtx)
+		}()
+
+		// Wait for reconnect signal or context cancellation
+		select {
+		case <-m.reconnectChan:
+			m.log.Infof("Received reconnect signal for user data stream. Reconnecting...")
+			// Cancel and wait for the listen key maintenance goroutine to stop
+			cancelKeyRefresh()
+			keyRefreshWg.Wait()
+			// Wait a brief moment for any pending operations to complete
+			time.Sleep(1 * time.Second)
+			// Create new context for the next iteration
+			keyRefreshCtx, cancelKeyRefresh = context.WithCancel(ctx)
+			continue connectLoop
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// handleUserDataMessage processes messages from the user data stream.
+func (m *mexc) handleUserDataMessage(msg []byte) {
+	// Log the raw message for debugging purposes
+	m.log.Debugf("User data message: %s", string(msg))
+
+	// Check if the message is empty
+	if len(msg) == 0 {
+		m.log.Warnf("Received empty user data message")
+		return
+	}
+
+	// First, try to parse as a standard JSON message
+	var baseMsg struct {
+		Ping      int64           `json:"ping,omitempty"`
+		Channel   string          `json:"c,omitempty"` // Channel name
+		EventType string          `json:"e,omitempty"` // Event type
+		Data      json.RawMessage `json:"d,omitempty"` // Data payload
+	}
+	if err := json.Unmarshal(msg, &baseMsg); err != nil {
+		m.log.Errorf("Failed to unmarshal user data message as JSON: %v", err)
+		return
+	}
+
+	// Handle ping/pong messages
+	if baseMsg.Ping > 0 {
+		if err := m.sendPong(baseMsg.Ping); err != nil {
+			m.log.Errorf("Failed to send pong: %v", err)
+		}
+		return
+	}
+
+	// Handle message based on the EventType field (JSON tag "e")
+	if baseMsg.EventType != "" {
+		switch baseMsg.EventType {
+		case "spot@private.orders.v3.api":
+			// Forward the message to the appropriate handler
+			m.handleOrderUpdateMessage(msg)
+		case "spot@private.deals.v3.api":
+			m.handleTradeUpdateMessage(msg)
+		case "spot@private.account.v3.api":
+			m.handleAccountUpdateMessage(msg)
+		default:
+			m.log.Warnf("Unhandled user data message event type: %s", baseMsg.EventType)
+		}
+		return
+	}
+
+	// For regular messages, handle by channel (JSON tag "c")
+	if baseMsg.Channel != "" {
+		switch baseMsg.Channel {
+		case "spot@private.orders.v3.api":
+			m.handleOrderUpdateMessage(msg)
+		case "spot@private.deals.v3.api":
+			m.handleTradeUpdateMessage(msg)
+		case "spot@private.account.v3.api":
+			m.handleAccountUpdateMessage(msg)
+		default:
+			m.log.Warnf("Unhandled user data message channel: %s", baseMsg.Channel)
+		}
+	} else {
+		m.log.Warnf("Unhandled user data message: %s", string(msg))
+	}
+}
+
+// handleOrderUpdateMessage processes order update messages from the user data stream.
+func (m *mexc) handleOrderUpdateMessage(msg []byte) {
+	m.log.Debugf("[UserWS] Order update: %s", string(msg))
+
+	var baseMsg struct {
+		Data json.RawMessage `json:"d,omitempty"` // Data payload with JSON tag "d"
+	}
+	if err := json.Unmarshal(msg, &baseMsg); err != nil {
+		m.log.Errorf("Failed to unmarshal order update message: %v", err)
+		return
+	}
+
+	// Parse the data field (JSON tag "d") which contains the order update
+	var orderUpdate mexctypes.WsOrderUpdateData
+	if err := json.Unmarshal(baseMsg.Data, &orderUpdate); err != nil {
+		m.log.Errorf("Failed to unmarshal order update data: %v, data: %s", err, string(baseMsg.Data))
+		return
+	}
+
+	// Process the order update here
+	m.log.Debugf("[OrderUpdate] ID: %s, Status: %s, Side: %s, Type: %s",
+		orderUpdate.OrderID, orderUpdate.Status, orderUpdate.Side, orderUpdate.Type)
+
+	// Call the order manager (assume it's not available yet, comment out for now)
+	// Placeholder for future implementation
+	// if m.orderMgr != nil {
+	//     m.orderMgr.Update(orderUpdate.OrderID, orderUpdate.Status, orderUpdate.ClientOrderID)
+	// }
+
+	// Process the order update for active trades
+	m.activeTradesMtx.RLock()
+	tradeInfo, exists := m.activeTrades[orderUpdate.OrderID]
+	m.activeTradesMtx.RUnlock()
+
+	if exists {
+		// Handle completion based on status
+		complete := false
+		switch orderUpdate.Status {
+		case "FILLED", "CANCELED", "PARTIALLY_CANCELED":
+			complete = true
+		}
+
+		if complete {
+			m.activeTradesMtx.Lock()
+			// Re-check existence after acquiring write lock
+			tradeInfo, stillExists := m.activeTrades[orderUpdate.OrderID]
+			if stillExists {
+				// Create trade update with latest info
+				tradeUpdate := &Trade{
+					ID:          orderUpdate.OrderID,
+					Sell:        orderUpdate.Side == "SELL",
+					Qty:         tradeInfo.qty,
+					Rate:        tradeInfo.rate,
+					BaseID:      tradeInfo.baseID,
+					QuoteID:     tradeInfo.quoteID,
+					BaseFilled:  tradeInfo.baseFilled,
+					QuoteFilled: tradeInfo.quoteFilled,
+					Complete:    true,
+				}
+
+				// Remove from tracking
+				delete(m.activeTrades, orderUpdate.OrderID)
+				m.activeTradesMtx.Unlock()
+
+				// Notify subscriber
+				m.notifySubscriber(tradeInfo.updaterID, tradeUpdate)
+			} else {
+				m.activeTradesMtx.Unlock()
+			}
+		}
+	}
+}
+
+// handleTradeUpdateMessage processes trade/deal update messages from the user data stream.
+func (m *mexc) handleTradeUpdateMessage(msg []byte) {
+	m.log.Debugf("[UserWS] Trade update: %s", string(msg))
+
+	var baseMsg struct {
+		Data json.RawMessage `json:"d,omitempty"` // Data payload with JSON tag "d"
+	}
+	if err := json.Unmarshal(msg, &baseMsg); err != nil {
+		m.log.Errorf("Failed to unmarshal trade update message: %v", err)
+		return
+	}
+
+	// Parse the data field (JSON tag "d") which contains the trade update
+	var tradeUpdate mexctypes.WsDealUpdateData
+	if err := json.Unmarshal(baseMsg.Data, &tradeUpdate); err != nil {
+		m.log.Errorf("Failed to unmarshal trade update data: %v, data: %s", err, string(baseMsg.Data))
+		return
+	}
+
+	// Process the trade update here
+	m.log.Debugf("[TradeUpdate] Deal ID: %s, OrderID: %s, Side: %s",
+		tradeUpdate.DealID, tradeUpdate.OrderID, tradeUpdate.Side)
+
+	// Handle the trade update for active trades
+	m.activeTradesMtx.Lock()
+	if _, exists := m.activeTrades[tradeUpdate.OrderID]; exists {
+		// Process trade updates similar to existing implementation
+		// Update filled amounts, check for completion, etc.
+		m.log.Debugf("Found active trade for OrderID %s, processing update", tradeUpdate.OrderID)
+	}
+	m.activeTradesMtx.Unlock()
+}
+
+// handleAccountUpdateMessage processes account update messages from the user data stream.
+func (m *mexc) handleAccountUpdateMessage(msg []byte) {
+	m.log.Debugf("[UserWS] Account update: %s", string(msg))
+
+	var baseMsg mexctypes.WsMessage
+	if err := json.Unmarshal(msg, &baseMsg); err != nil {
+		m.log.Errorf("Failed to unmarshal account update message: %v", err)
+		return
+	}
+
+	// Parse the data field which contains the account update
+	var accountUpdates []mexctypes.WsAccountUpdateData
+	if err := json.Unmarshal(baseMsg.Data, &accountUpdates); err != nil {
+		m.log.Errorf("Failed to unmarshal account update data: %v, data: %s", err, string(baseMsg.Data))
+		return
+	}
+
+	// Process the account updates
+	for _, update := range accountUpdates {
+		m.log.Debugf("[AccountUpdate] Asset: %s, Available: %s, Locked: %s",
+			update.Asset, update.Available, update.Locked)
+	}
+
+	// Handle the account update (e.g., update balance cache)
+	// Implementation depends on how balances are tracked in the system
+}
+
+// sendPong responds to a ping message with a pong to keep the user data stream alive.
+func (m *mexc) sendPong(pingTime int64) error {
+	pongMsg := mexctypes.WsPong{
+		Pong: pingTime,
+	}
+	pongBytes, err := json.Marshal(pongMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal pong message: %v", err)
+	}
+
+	m.log.Debugf("[UserWS] Sending PONG response to ping %d", pingTime)
+	return m.userDataStream.SendRaw(pongBytes)
 }
