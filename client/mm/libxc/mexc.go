@@ -1081,30 +1081,41 @@ func (m *mexc) updateSymbolMappings(callerHoldsCoinLock bool) {
 		m.log.Warnf("Cannot update symbol mappings: coinInfo not loaded")
 		return
 	}
-	// fmt.Println("PRINTF_DEBUG: Starting updateSymbolMappings...") // Remove Printf
 
 	m.assetSymbolToCoin = make(map[string]string)
 	m.assetIDToCoin = make(map[uint32]string)
 	m.coinToAssetIDs = make(map[string][]uint32)
 	mappedCount := 0
 
-	// Target DEX symbols we care about (e.g., DCR, BTC, USDT variants)
-	targetSymbols := map[string]bool{
-		"dcr":          true,
-		"btc":          true, // Add BTC
-		"usdt.polygon": true, // Keep specific USDT variant
-		"usdt.erc20":   true, // Add another USDT variant if needed
-		"usdt.trc20":   true, // Add another USDT variant if needed
-		// Add other desired symbols here
+	// Check if DCR exists in MEXC coin info
+	dcrFound := false
+	for mexcCoinUpper, coinData := range m.coinInfo {
+		if strings.ToUpper(mexcCoinUpper) == "DCR" {
+			dcrFound = true
+			m.log.Debugf("Found DCR in MEXC coin info")
+
+			// Check if it has networks
+			if len(coinData.NetworkList) > 0 {
+				for _, netInfo := range coinData.NetworkList {
+					m.log.Debugf("DCR network found: %s, deposit enabled: %v, withdraw enabled: %v",
+						netInfo.Network, netInfo.DepositEnable, netInfo.WithdrawEnable)
+				}
+			} else {
+				m.log.Warnf("DCR found but has no network list in MEXC coin info")
+			}
+			break
+		}
+	}
+
+	if !dcrFound {
+		m.log.Warnf("DCR not found in MEXC coin info, will add manual mapping")
 	}
 
 	for mexcCoinUpper, coinData := range m.coinInfo {
-		// Optimization: Skip coins not potentially part of targetSymbols
-		// Note: This is a rough check, as we don't know the network suffix yet.
-		if !(strings.Contains(strings.ToLower(mexcCoinUpper), "dcr") ||
-			strings.Contains(strings.ToLower(mexcCoinUpper), "btc") ||
-			strings.Contains(strings.ToLower(mexcCoinUpper), "usdt")) { // Adjust check based on targetSymbols
-			// continue // Keep commented to map all enabled coins, uncomment for optimization
+		// Skip coins with no network list
+		if len(coinData.NetworkList) == 0 {
+			m.log.Debugf("Skipping %s: No network list", mexcCoinUpper)
+			continue
 		}
 
 		for _, netInfo := range coinData.NetworkList {
@@ -1116,18 +1127,11 @@ func (m *mexc) updateSymbolMappings(callerHoldsCoinLock bool) {
 				continue
 			}
 
-			// Check if the generated DEX symbol is one we are interested in mapping
-			// OR if we want to map all known symbols (remove this check)
-			if !targetSymbols[dexSymbol] {
-				// continue // Keep commented to map all enabled coins, uncomment for optimization
-			}
-
 			assetID, found := m.symbolToAssetID[dexSymbol]
 			if !found {
-				// fmt.Printf("PRINTF_DEBUG:  -> Failed: ...\n") // Remove Printf
 				continue
 			}
-			// fmt.Printf("PRINTF_DEBUG:  -> Success: ...\n") // Remove Printf
+
 			m.assetSymbolToCoin[dexSymbol] = mexcCoinUpper
 			m.assetIDToCoin[assetID] = mexcCoinUpper
 			foundSlice := false
@@ -1141,14 +1145,45 @@ func (m *mexc) updateSymbolMappings(callerHoldsCoinLock bool) {
 				m.coinToAssetIDs[mexcCoinUpper] = append(m.coinToAssetIDs[mexcCoinUpper], assetID)
 			}
 			mappedCount++
+
+			m.log.Debugf("Mapped %s (ID: %d) to MEXC coin %s", dexSymbol, assetID, mexcCoinUpper)
 		}
 	}
+
+	// Add special case for DCR if not mapped already
+	_, hasDCR := m.assetIDToCoin[42] // Decred's asset ID is typically 42
+	if !hasDCR {
+		m.log.Infof("Adding manual mapping for DCR (Decred) with asset ID 42")
+		dcrAssetID := uint32(42)
+		dcrSymbol := "dcr"
+		mexcDCRSymbol := "DCR"
+
+		// Add mappings for DCR
+		m.assetSymbolToCoin[dcrSymbol] = mexcDCRSymbol
+		m.assetIDToCoin[dcrAssetID] = mexcDCRSymbol
+
+		// Create or append to slice
+		found := false
+		for _, id := range m.coinToAssetIDs[mexcDCRSymbol] {
+			if id == dcrAssetID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.coinToAssetIDs[mexcDCRSymbol] = append(m.coinToAssetIDs[mexcDCRSymbol], dcrAssetID)
+			mappedCount++
+		}
+	} else {
+		m.log.Debugf("DCR (ID: 42) already mapped to %s", m.assetIDToCoin[42])
+	}
+
 	m.log.Infof("Updated MEXC symbol mappings: %d targeted asset IDs mapped.", mappedCount)
 	if mappedCount < 2 {
 		m.log.Warnf("Expected at least DCR and USDT.polygon mappings, but only found %d.", mappedCount)
 	}
 
-	// --- Add Temp Debug Logging ---
+	// --- Log Final Mapping ---
 	logMsg := strings.Builder{}
 	logMsg.WriteString("Final coinToAssetIDs map contents:")
 	mapKeys := make([]string, 0, len(m.coinToAssetIDs))
@@ -1160,7 +1195,19 @@ func (m *mexc) updateSymbolMappings(callerHoldsCoinLock bool) {
 		logMsg.WriteString(fmt.Sprintf("\n  %s: %v", k, m.coinToAssetIDs[k]))
 	}
 	m.log.Debugf(logMsg.String())
-	// --- End Temp Debug Logging ---
+
+	// Log asset ID to coin mappings
+	idMsg := strings.Builder{}
+	idMsg.WriteString("Asset ID to MEXC coin mappings:")
+	idKeys := make([]uint32, 0, len(m.assetIDToCoin))
+	for k := range m.assetIDToCoin {
+		idKeys = append(idKeys, k)
+	}
+	sort.Slice(idKeys, func(i, j int) bool { return idKeys[i] < idKeys[j] })
+	for _, k := range idKeys {
+		idMsg.WriteString(fmt.Sprintf("\n  ID %d: %s", k, m.assetIDToCoin[k]))
+	}
+	m.log.Debugf(idMsg.String())
 }
 
 // mapMEXCCoinNetworkToDEXSymbol attempts to construct a DEX symbol (lowercase)
