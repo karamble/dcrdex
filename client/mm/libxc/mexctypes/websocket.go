@@ -8,6 +8,23 @@ type WsRequest struct {
 	Params []string `json:"params"` // e.g., ["spot@public.increase.depth.v3.api@BTCUSDT"]
 }
 
+// WsSubResponse is returned after subscription requests
+type WsSubResponse struct {
+	ID     int64   `json:"id"`
+	Result *bool   `json:"result"`
+	Error  *string `json:"error,omitempty"`
+	Code   int     `json:"code,omitempty"`
+	Msg    string  `json:"msg,omitempty"`
+}
+
+// WsPBWrapper wraps protocol buffer encoded data in WebSocket messages.
+type WsPBWrapper struct {
+	Topic string          `json:"topic"`
+	Data  []byte          `json:"data"`
+	Time  int64           `json:"time,omitempty"`
+	ID    json.RawMessage `json:"id,omitempty"`
+}
+
 // Generic incoming message to determine type
 type WsMessage struct {
 	Channel string          `json:"c,omitempty"`    // Channel name, e.g., "spot@public.increase.depth.v3.api"
@@ -37,11 +54,6 @@ type WsDepthUpdateData struct {
 }
 
 // --- User Data Stream Payloads --- //
-
-// ListenKeyResponse structure for POST /api/v3/userDataStream.
-type ListenKeyResponse struct {
-	ListenKey string `json:"listenKey"`
-}
 
 // WsOrderUpdateData is the payload ('d' field) for spot@private.orders.v3.api
 type WsOrderUpdateData struct {

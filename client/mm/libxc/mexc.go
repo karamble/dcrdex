@@ -3885,22 +3885,17 @@ func (m *mexc) handleOrderUpdateMessage(msg []byte) {
 		return
 	}
 
-	// Process the order update here
-	m.log.Debugf("[OrderUpdate] ID: %s, Status: %s, Side: %s, Type: %s",
-		orderUpdate.OrderID, orderUpdate.Status, orderUpdate.Side, orderUpdate.Type)
-
-	// Call the order manager (assume it's not available yet, comment out for now)
-	// Placeholder for future implementation
-	// if m.orderMgr != nil {
-	//     m.orderMgr.Update(orderUpdate.OrderID, orderUpdate.Status, orderUpdate.ClientOrderID)
-	// }
-
 	// Process the order update for active trades
 	m.activeTradesMtx.RLock()
 	tradeInfo, exists := m.activeTrades[orderUpdate.OrderID]
 	m.activeTradesMtx.RUnlock()
 
 	if exists {
+		// Process the order update here with tradeInfo available
+		m.log.Debugf("[OrderUpdate] ID: %s, Status: %s, Side: %s, Type: %s, BaseID: %d, QuoteID: %d",
+			orderUpdate.OrderID, orderUpdate.Status, orderUpdate.Side, orderUpdate.Type,
+			tradeInfo.baseID, tradeInfo.quoteID)
+
 		// Handle completion based on status
 		complete := false
 		switch orderUpdate.Status {
@@ -3936,6 +3931,10 @@ func (m *mexc) handleOrderUpdateMessage(msg []byte) {
 				m.activeTradesMtx.Unlock()
 			}
 		}
+	} else {
+		// Just log basic info if no active trade found
+		m.log.Debugf("[OrderUpdate] ID: %s, Status: %s, Side: %s, Type: %s (Not tracked)",
+			orderUpdate.OrderID, orderUpdate.Status, orderUpdate.Side, orderUpdate.Type)
 	}
 }
 
