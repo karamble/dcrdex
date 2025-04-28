@@ -133,21 +133,21 @@ type mexc struct {
 
 // mexcOrderBook struct definition
 type mexcOrderBook struct {
-	mtx              sync.RWMutex
-	synced           atomic.Bool
-	syncChan         chan struct{} // Closed when initial sync completes
-	stopChan         chan struct{} // Closed to signal run loop exit
-	numSubscribers   uint32
-	getSnapshot      func(ctx context.Context, symbol string) (*mexctypes.DepthResponse, error)
-	book             *orderbook // Use local type
-	updateQueue      chan *mexctypes.WsDepthUpdateData
-	mktSymbol        string
-	baseFactor       uint64
-	quoteFactor      uint64
-	log              dex.Logger
-	lastUpdateID     uint64    // Use uint64 for comparison
-	connectedChan    chan bool // Channel to communicate connection status changes
-	requireFreshSync bool      // When true, force a fresh sync on resubscribe
+	mtx             sync.RWMutex
+	synced          atomic.Bool
+	syncChan        chan struct{} // Closed when initial sync completes
+	stopChan        chan struct{} // Closed to signal run loop exit
+	numSubscribers  uint32
+	getSnapshot     func(ctx context.Context, symbol string) (*mexctypes.DepthResponse, error)
+	book            *orderbook // Use local type
+	updateQueue     chan *mexctypes.WsDepthUpdateData
+	mktSymbol       string
+	baseFactor      uint64
+	quoteFactor     uint64
+	log             dex.Logger
+	lastUpdateID    uint64    // Use uint64 for comparison
+	connectedChan   chan bool // Channel to communicate connection status changes
+	lastSyncAttempt time.Time // Track last sync attempt time to rate limit sync requests
 }
 
 // newMEXC constructor (Configure RawHandler)
@@ -1438,77 +1438,57 @@ func (m *mexc) SubscribeMarket(ctx context.Context, baseID, quoteID uint32) erro
 		return fmt.Errorf("map error: %w", err)
 	}
 
-	// 2. Handle order book instance management
+	// 2. Handle order book instance management - now much simpler
 	m.booksMtx.Lock()
 	book, exists := m.books[mexcSymbol]
 
-	// Check if book exists but needs fresh sync (after bot restart)
-	if exists && book.requireFreshSync {
-		m.log.Infof("Found existing orderbook for %s marked for fresh sync, recreating it", mexcSymbol)
-		// Stop the existing book's run goroutine
-		book.stop()
-		// Delete it from the map to force recreation
-		delete(m.books, mexcSymbol)
-		exists = false
-	}
-
 	if exists {
-		m.log.Infof("Found existing orderbook for %s, checking sync status", mexcSymbol)
+		// Just increment subscriber count and start using existing book
 		book.mtx.Lock()
 		book.numSubscribers++
+		subscriberCount := book.numSubscribers
 		isSynced := book.synced.Load()
-		// Create a new syncChan if needed - this is critical for proper waiting
-		if !isSynced {
-			// Close existing syncChan if it's not nil and create a new one
-			select {
-			case <-book.syncChan:
-				// Channel already closed, create a new one
-			default:
-				// Channel not closed, leave it
-			}
-			// Ensure we have a fresh channel for synchronization
-			book.syncChan = make(chan struct{})
-		}
-		syncChan := book.syncChan
 		book.mtx.Unlock()
 
-		m.log.Debugf("Incremented subscriber count for %s to %d (synced: %v)", mexcSymbol, book.numSubscribers, isSynced)
+		m.log.Debugf("Incremented subscriber count for %s to %d (synced: %v)", mexcSymbol, subscriberCount, isSynced)
 		m.booksMtx.Unlock()
 
-		// If the book exists but is not synced, trigger a resync and wait for it
+		// We don't force a resync or resubscribe - the book should already be maintained
+		// Just wait for sync if it's not already synced
 		if !isSynced {
-			// First, resubscribe to the WebSocket feed for this market
-			m.marketStreamMtx.Lock()
-			err := m.subscribeToAdditionalMarket(ctx, mexcSymbol)
-			m.marketStreamMtx.Unlock()
-			if err != nil {
-				m.log.Errorf("Failed to resubscribe to market %s: %v", mexcSymbol, err)
-				return fmt.Errorf("failed to resubscribe to market %s: %w", mexcSymbol, err)
-			}
+			m.log.Infof("Waiting for existing orderbook %s to complete synchronization", mexcSymbol)
 
-			m.log.Infof("Existing book for %s is not synced, forcing resync", mexcSymbol)
-			// Force immediate resync of this book
-			if !book.syncOrderbook(ctx) {
-				m.log.Errorf("Failed to sync orderbook for %s", mexcSymbol)
-				return fmt.Errorf("failed to sync orderbook for %s", mexcSymbol)
-			}
+			// Setup a channel to wait on
+			syncWaitChan := make(chan struct{})
+			go func() {
+				// Poll for synced state with timeout
+				startTime := time.Now()
+				for time.Since(startTime) < 30*time.Second {
+					if book.synced.Load() {
+						close(syncWaitChan)
+						return
+					}
+					time.Sleep(500 * time.Millisecond)
+				}
+				// Timeout occurred
+				close(syncWaitChan)
+			}()
 
-			// Wait for synchronization to complete with a timeout
-			m.log.Infof("Waiting for orderbook %s to complete synchronization", mexcSymbol)
-			syncTimeout := time.NewTimer(30 * time.Second)
+			// Wait with timeout
 			select {
-			case <-syncChan: // syncChan is closed when sync completes
-				m.log.Infof("Orderbook for %s successfully synchronized", mexcSymbol)
-				syncTimeout.Stop()
-			case <-syncTimeout.C:
-				return fmt.Errorf("timed out waiting for %s orderbook to synchronize", mexcSymbol)
+			case <-syncWaitChan:
+				if !book.synced.Load() {
+					m.log.Warnf("Timed out waiting for orderbook %s to synchronize, but continuing", mexcSymbol)
+					// We continue anyway - the bot will still function but might return errors initially
+				} else {
+					m.log.Infof("Orderbook for %s successfully synchronized", mexcSymbol)
+				}
 			case <-ctx.Done():
-				syncTimeout.Stop()
 				return ctx.Err()
 			}
 		}
 
-		return nil // Already subscribed, just increment count
+		return nil // Already subscribed, just incremented count
 	}
 
 	// First subscriber for this specific market, create the book instance.
@@ -1531,16 +1511,14 @@ func (m *mexc) SubscribeMarket(ctx context.Context, baseID, quoteID uint32) erro
 	)
 	newBook.numSubscribers = 1
 	m.books[mexcSymbol] = newBook
-	// Keep track of the syncChan before unlocking
 	syncChan := newBook.syncChan
 	m.booksMtx.Unlock() // Unlock BEFORE potentially blocking network calls or starting goroutine
 
-	// Start the book's run goroutine (manages sync state)
+	// Start the book's run goroutine (manages sync state) - this continues even when no subscribers
 	go newBook.run(ctx, m.marketSubResyncChan)
 
 	// 3. Handle WebSocket subscription (Connection is managed by Connect method)
 	m.marketStreamMtx.Lock()
-	// Assume Connect() started the connection attempt. Try to subscribe.
 	err = m.subscribeToAdditionalMarket(ctx, mexcSymbol)
 	m.marketStreamMtx.Unlock()
 
@@ -1562,7 +1540,8 @@ func (m *mexc) SubscribeMarket(ctx context.Context, baseID, quoteID uint32) erro
 		m.log.Infof("Orderbook for %s successfully synchronized", mexcSymbol)
 		syncTimeout.Stop()
 	case <-syncTimeout.C:
-		return fmt.Errorf("timed out waiting for %s orderbook to synchronize", mexcSymbol)
+		m.log.Warnf("Timed out waiting for %s orderbook to synchronize, but continuing", mexcSymbol)
+		// Continue anyway - it might sync shortly after timeout
 	case <-ctx.Done():
 		syncTimeout.Stop()
 		return ctx.Err()
@@ -1800,7 +1779,8 @@ func (m *mexc) Withdraw(ctx context.Context, assetID uint32, atoms uint64, addre
 	return resp.WithdrawID, nil
 }
 
-// UnsubscribeMarket unsubscribes from order book updates.
+// UnsubscribeMarket decrements the subscriber count but DOES NOT unsubscribe from the WebSocket feed
+// to maintain persistent orderbook state between bot start/stop cycles.
 func (m *mexc) UnsubscribeMarket(baseID, quoteID uint32) error {
 	m.log.Debugf("Unsubscribing from MEXC market %d/%d", baseID, quoteID)
 
@@ -1810,60 +1790,25 @@ func (m *mexc) UnsubscribeMarket(baseID, quoteID uint32) error {
 		return fmt.Errorf("cannot map DEX IDs to MEXC symbol for unsubscribe: %w", err)
 	}
 
-	// 2. Decrement subscriber count / remove book
+	// 2. Decrement subscriber count only
 	m.booksMtx.Lock()
+	defer m.booksMtx.Unlock()
+
 	book, exists := m.books[mexcSymbol]
 	if !exists {
-		m.booksMtx.Unlock()
 		m.log.Warnf("Attempted to unsubscribe from non-existent book %s", mexcSymbol)
 		return nil // Not subscribed, nothing to do
 	}
 
-	if book.numSubscribers > 1 {
+	// Decrement counter but DON'T unsubscribe or remove book
+	book.mtx.Lock()
+	if book.numSubscribers > 0 {
 		book.numSubscribers--
-		m.log.Debugf("Decremented subscriber count for %s to %d", mexcSymbol, book.numSubscribers)
-		m.booksMtx.Unlock()
-		return nil // Still other subscribers
 	}
+	newCount := book.numSubscribers
+	book.mtx.Unlock()
 
-	// Last subscriber, remove book and potentially send unsubscribe message
-	delete(m.books, mexcSymbol)
-	numRemainingBooks := len(m.books)
-	m.booksMtx.Unlock()
-
-	m.log.Infof("Last subscriber for %s, removing book (remaining books: %d).", mexcSymbol, numRemainingBooks)
-
-	// Stop the book's sync goroutine
-	book.stop()
-
-	// 3. Send unsubscribe message if WebSocket is connected
-	m.marketStreamMtx.Lock()
-	defer m.marketStreamMtx.Unlock()
-
-	if m.marketStream == nil || m.marketStream.IsDown() {
-		m.log.Warnf("Cannot send unsubscribe for %s, market stream not connected or nil.", mexcSymbol)
-		return nil // Can't send if not connected
-	}
-
-	// Marshal and send
-	channel := fmt.Sprintf("spot@public.increase.depth.v3.api@%s", mexcSymbol)
-	req := mexctypes.WsRequest{
-		Method: "UNSUBSCRIPTION",
-		Params: []string{channel},
-	}
-	reqBytes, marshalErr := json.Marshal(req)
-	if marshalErr != nil {
-		m.log.Errorf("Failed to marshal market unsubscription request for %s: %v", mexcSymbol, marshalErr)
-		return nil // Return nil to indicate local cleanup succeeded despite marshal failure.
-	}
-	m.log.Debugf("[MarketWS] Sending UNSUBSCRIPTION for %s", mexcSymbol)
-	err = m.marketStream.SendRaw(reqBytes)
-	if err != nil {
-		m.log.Errorf("Failed to send MEXC market unsubscription for %s: %v", mexcSymbol, err)
-		return fmt.Errorf("failed to send market unsubscription: %w", err)
-	}
-
-	m.log.Infof("Sent unsubscription request for %s", mexcSymbol)
+	m.log.Debugf("Decremented subscriber count for %s to %d (maintaining subscription)", mexcSymbol, newCount)
 	return nil
 }
 
@@ -2107,7 +2052,7 @@ func (m *mexc) handleDepthUpdate(msg *mexctypes.WsMessage) {
 	// Handle empty version field gracefully - MEXC sometimes sends empty version
 	// strings in depth updates. Instead of requesting resyncs, we'll just log and ignore.
 	if depthUpdate.Version == "" {
-		m.log.Debugf("[MarketWS] Received depth update with empty version for %s, ignoring", symbol)
+		// m.log.Debugf("[MarketWS] Received depth update with empty version for %s, ignoring", symbol)
 		return
 	}
 
@@ -3376,17 +3321,17 @@ func newMEXCOrderBook(
 	getSnapshotFunc func(ctx context.Context, symbol string) (*mexctypes.DepthResponse, error),
 ) *mexcOrderBook {
 	return &mexcOrderBook{
-		mktSymbol:        mktSymbol,
-		baseFactor:       baseFactor,
-		quoteFactor:      quoteFactor,
-		log:              log,
-		getSnapshot:      getSnapshotFunc,
-		book:             newOrderBook(),
-		updateQueue:      make(chan *mexctypes.WsDepthUpdateData, 256), // Buffered queue
-		syncChan:         make(chan struct{}),                          // Unclosed initially
-		stopChan:         make(chan struct{}),                          // For stopping the run goroutine
-		connectedChan:    make(chan bool),                              // Channel to communicate connection status changes
-		requireFreshSync: false,
+		mktSymbol:       mktSymbol,
+		baseFactor:      baseFactor,
+		quoteFactor:     quoteFactor,
+		log:             log,
+		getSnapshot:     getSnapshotFunc,
+		book:            newOrderBook(),
+		updateQueue:     make(chan *mexctypes.WsDepthUpdateData, 256), // Buffered queue
+		syncChan:        make(chan struct{}),                          // Unclosed initially
+		stopChan:        make(chan struct{}),                          // For stopping the run goroutine
+		connectedChan:   make(chan bool),                              // Channel to communicate connection status changes
+		lastSyncAttempt: time.Time{},                                  // Track last sync attempt time to rate limit sync requests
 	}
 }
 
@@ -3476,6 +3421,18 @@ func (ob *mexcOrderBook) stop() {
 func (ob *mexcOrderBook) syncOrderbook(ctx context.Context) bool {
 	ob.log.Infof("Attempting to sync order book for %s...", ob.mktSymbol)
 	ob.synced.Store(false)
+
+	// Track last sync attempt time to avoid excessive sync requests
+	ob.mtx.Lock()
+	now := time.Now()
+	// Rate limit sync attempts to no more than once per second
+	if now.Sub(ob.lastSyncAttempt) < time.Second {
+		ob.log.Debugf("Sync attempt for %s throttled (last attempt: %v)", ob.mktSymbol, ob.lastSyncAttempt)
+		ob.mtx.Unlock()
+		return false
+	}
+	ob.lastSyncAttempt = now
+	ob.mtx.Unlock()
 
 	// Drain queue of any updates received before snapshot fetch started
 	drainedCount := 0
@@ -3582,9 +3539,6 @@ drainLoop:
 
 	ob.synced.Store(true)
 
-	// Mark book as no longer requiring fresh sync once successfully synced
-	ob.requireFreshSync = false
-
 	// Signal completion by closing the syncChan
 	ob.mtx.Lock()
 	select {
@@ -3602,6 +3556,13 @@ drainLoop:
 
 // processUpdate handles an incoming WebSocket depth update.
 func (ob *mexcOrderBook) processUpdate(update *mexctypes.WsDepthUpdateData, resyncChan chan<- string) {
+	// Handle empty version strings explicitly here too
+	if update.Version == "" {
+		// Empty version string, just log and ignore
+		ob.log.Tracef("Ignoring update with empty version string for %s", ob.mktSymbol)
+		return
+	}
+
 	updateVersion, err := strconv.ParseUint(update.Version, 10, 64)
 	if err != nil {
 		// Don't trigger resync for every parsing error
@@ -3685,55 +3646,27 @@ func (ob *mexcOrderBook) convertDepthEntries(mexcBids, mexcAsks [][2]json.Number
 func (m *mexc) CleanBotShutdown(ctx context.Context, baseID, quoteID uint32) error {
 	m.log.Infof("Performing clean bot shutdown for market %d/%d...", baseID, quoteID)
 
-	// 1. Convert baseID/quoteID to MEXC symbol
+	// 1. Convert baseID/quoteID to MEXC symbol (needed for context/logging mainly)
 	mexcSymbol, err := m.mapDEXIDsToMEXCSymbol(baseID, quoteID)
 	if err != nil {
 		m.log.Warnf("Could not map market %d/%d to MEXC symbol: %v", baseID, quoteID, err)
 		// Continue with cleanup even if we can't map the symbol
 	} else {
-		// 2. Explicitly unsubscribe from the WebSocket feed first
-		if m.marketStream != nil && !m.marketStream.IsDown() {
-			channel := fmt.Sprintf("spot@public.increase.depth.v3.api@%s", mexcSymbol)
-			unsubReq := mexctypes.WsRequest{
-				Method: "UNSUBSCRIPTION",
-				Params: []string{channel},
-			}
-			unsubBytes, marshalErr := json.Marshal(unsubReq)
-			if marshalErr != nil {
-				m.log.Warnf("Failed to marshal market unsubscription request for %s: %v", mexcSymbol, marshalErr)
-			} else {
-				// Send unsubscribe message regardless of local subscription status
-				m.log.Infof("[MarketWS] Explicitly unsubscribing from %s during bot shutdown", mexcSymbol)
-				if err := m.marketStream.SendRaw(unsubBytes); err != nil {
-					m.log.Warnf("Failed to send explicit unsubscription for %s: %v", mexcSymbol, err)
-				} else {
-					// Small delay to ensure the unsubscribe is processed
-					time.Sleep(500 * time.Millisecond)
-				}
-			}
-		}
-
-		// 3. Now use regular UnsubscribeMarket to update local state
-		err = m.UnsubscribeMarket(baseID, quoteID)
-		if err != nil {
-			m.log.Warnf("Error unsubscribing from market %d/%d: %v", baseID, quoteID, err)
-			// Continue with cleanup even if unsubscribe fails
-		}
-
-		// 4. Mark this specific book as requiring fresh sync on restart
-		m.booksMtx.Lock()
-		if book, exists := m.books[mexcSymbol]; exists {
-			book.requireFreshSync = true
-			book.synced.Store(false)
-			m.log.Infof("Marked book for %s as requiring fresh sync on restart", mexcSymbol)
-		}
-		m.booksMtx.Unlock()
+		m.log.Infof("Mapped market %d/%d to MEXC symbol %s for shutdown", baseID, quoteID, mexcSymbol)
 	}
 
-	// 5. Clear trade tracking state for this market pair
+	// 2. Use regular UnsubscribeMarket to update local state (decrement count)
+	// but keep the WebSocket subscription active
+	err = m.UnsubscribeMarket(baseID, quoteID)
+	if err != nil {
+		m.log.Warnf("Error unsubscribing from market %d/%d: %v", baseID, quoteID, err)
+		// Continue with cleanup even if unsubscribe fails
+	}
+
+	// 3. Clear trade tracking state for this market pair
 	m.clearTradeTrackingForMarket(baseID, quoteID)
 
-	// 6. Cancel any active trades for this market pair
+	// 4. Cancel any active trades for this market pair
 	m.activeTradesMtx.RLock()
 	marketTradeIDs := make([]string, 0)
 	for tradeID, tradeInfo := range m.activeTrades {
@@ -3751,7 +3684,7 @@ func (m *mexc) CleanBotShutdown(ctx context.Context, baseID, quoteID uint32) err
 		}
 	}
 
-	m.log.Infof("Bot shutdown completed successfully for market %d/%d", baseID, quoteID)
+	m.log.Infof("Bot shutdown completed successfully for market %d/%d (maintaining orderbook state)", baseID, quoteID)
 	return nil
 }
 
