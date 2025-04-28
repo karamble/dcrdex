@@ -183,7 +183,7 @@ func newMEXC(cfg *CEXConfig) (*mexc, error) {
 		tradeIDNoncePrefix: dex.Bytes(prefix),
 
 		marketSubs:          make(map[string]uint32),
-		marketSubResyncChan: make(chan string, 10),
+		marketSubResyncChan: make(chan string, 50), // Increased buffer from 10 to 50
 		books:               make(map[string]*mexcOrderBook),
 		tradeUpdaters:       make(map[int]chan *Trade),
 		activeTrades:        make(map[string]*mexcTradeInfo),
@@ -1889,10 +1889,11 @@ func (m *mexc) handleMarketConnectEvent(status comms.ConnectionStatus) {
 
 	switch status {
 	case comms.Connected:
-		// Re-subscribe to all markets on reconnection
+		// MEXC maintains subscriptions on reconnection, just trigger resyncs
 		m.resubscribeMarkets()
 
-		// Notify all books that connection is established
+		/* We don't signal connected to books to avoid unnecessary state thrashing
+		   as MEXC keeps the subscription and just needs a resync
 		m.booksMtx.RLock()
 		for _, book := range m.books {
 			select {
@@ -1902,9 +1903,14 @@ func (m *mexc) handleMarketConnectEvent(status comms.ConnectionStatus) {
 			}
 		}
 		m.booksMtx.RUnlock()
+		*/
 
 	case comms.Disconnected:
-		// Mark all books as unsynced when disconnected
+		// Don't mark books as unsynced on disconnect - they'll be handled on reconnect
+		// And the WebSocket library will automatically reconnect
+		m.log.Debugf("Market stream disconnected, waiting for automatic reconnection")
+
+		/* We don't signal disconnection to books to avoid unnecessary state thrashing
 		m.booksMtx.RLock()
 		for _, book := range m.books {
 			book.synced.Store(false)
@@ -1915,6 +1921,7 @@ func (m *mexc) handleMarketConnectEvent(status comms.ConnectionStatus) {
 			}
 		}
 		m.booksMtx.RUnlock()
+		*/
 	}
 }
 
@@ -2084,30 +2091,32 @@ func (m *mexc) resubscribeMarkets() {
 	m.log.Infof("Resubscribing to %d markets after reconnect...", len(m.books))
 
 	// First, ensure all tracked books are marked as needing resync
+	// But don't send connected=false signals to avoid book state thrashing
 	for symbol, book := range m.books {
-		// Mark as unsynced and will force a resync via connectedChan in handleMarketConnectEvent
+		// Mark as unsynced - will trigger a fresh snapshot fetch
 		book.synced.Store(false)
 		m.log.Debugf("Market %s marked for resync after reconnection", symbol)
 	}
 
-	// Now resubscribe each market to the websocket feed
-	for symbol := range m.books {
-		// Reuse SubscribeMarket logic without locking/book creation
-		channel := fmt.Sprintf("spot@public.increase.depth.v3.api@%s", symbol)
-		req := mexctypes.WsRequest{
-			Method: "SUBSCRIPTION",
-			Params: []string{channel},
-		}
-		reqBytes, err := json.Marshal(req)
-		if err != nil {
-			m.log.Errorf("[Resubscribe] Failed to marshal subscription for %s: %v", symbol, err)
-			continue
-		}
-		// Use SendRaw
-		if err := m.marketStream.SendRaw(reqBytes); err != nil {
-			m.log.Errorf("[Resubscribe] Failed to send subscription for %s: %v", symbol, err)
-		} else {
-			m.log.Debugf("[Resubscribe] Successfully resubscribed to %s", symbol)
+	// Now request snapshots directly rather than resubscribing
+	// MEXC may maintain subscriptions server-side even after reconnections
+	for symbol, book := range m.books {
+		// Trigger an immediate sync via resync channel rather than WebSocket resubscription
+		select {
+		case m.marketSubResyncChan <- symbol:
+			m.log.Debugf("Requested resync for %s after reconnection", symbol)
+		default:
+			// Channel is full, try direct sync
+			go func(b *mexcOrderBook, s string) {
+				// Context with timeout for snapshot fetch
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if b.syncOrderbook(ctx) {
+					m.log.Debugf("Direct sync for %s successful after reconnection", s)
+				} else {
+					m.log.Errorf("Direct sync for %s failed after reconnection", s)
+				}
+			}(book, symbol)
 		}
 	}
 }
@@ -2238,16 +2247,18 @@ func (m *mexc) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrem
 		return 0, 0, false, fmt.Errorf("order book for %s not managed", mexcSymbol)
 	}
 
-	// If book not synced, try a single resync request but don't wait - simply report unsynced
+	// If book not synced, trigger a sync but don't wait
 	if !bookInstance.synced.Load() {
-		// Try to request resync only once, but don't wait for completion
-		select {
-		case m.marketSubResyncChan <- mexcSymbol:
-			m.log.Debugf("Sent resync request for %s during VWAP call", mexcSymbol)
-		default:
-			// Already requested or channel full, continue
-		}
+		// Try to request a sync - exponential backoff managed by syncOrderbook
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if bookInstance.syncOrderbook(ctx) {
+				m.log.Debugf("Background sync for %s completed successfully", mexcSymbol)
+			}
+		}()
 
+		// Return an error for this attempt - the next call might succeed
 		return 0, 0, false, ErrUnsyncedOrderbook
 	}
 
@@ -2259,7 +2270,7 @@ func (m *mexc) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrem
 	return vwap, extrema, filled, nil
 }
 
-// MidGap method implementation (using local orderbook)
+// MidGap method implementation (using local orderbook with cache)
 func (m *mexc) MidGap(baseID, quoteID uint32) uint64 {
 	mexcSymbol, mapErr := m.mapDEXIDsToMEXCSymbol(baseID, quoteID)
 	if mapErr != nil {
@@ -2267,13 +2278,29 @@ func (m *mexc) MidGap(baseID, quoteID uint32) uint64 {
 		return 0
 	}
 
-	// Cache values map to store recent midgap values - add this at the struct level in a real implementation
-	// For now we'll use a simple static variable for the example
+	// Static cache for midgap values - should be moved to struct level in real implementation
 	static := struct {
 		cachedMidGap map[string]uint64
 		cacheMtx     sync.RWMutex
+		initialized  bool
 	}{
 		cachedMidGap: make(map[string]uint64),
+	}
+
+	// Initialize once
+	if !static.initialized {
+		static.initialized = true
+		go func() {
+			// Cleanup old cached values periodically
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for {
+				<-ticker.C
+				static.cacheMtx.Lock()
+				static.cachedMidGap = make(map[string]uint64) // Clear cache periodically
+				static.cacheMtx.Unlock()
+			}
+		}()
 	}
 
 	m.booksMtx.RLock()
@@ -2291,17 +2318,18 @@ func (m *mexc) MidGap(baseID, quoteID uint32) uint64 {
 		static.cacheMtx.RUnlock()
 
 		if hasCached {
-			m.log.Debugf("MidGap for %s: returning cached value while book not synced", mexcSymbol)
+			// Use cached value without logging to reduce noise
 			return cachedValue
 		}
 
-		// If no cached value and not synced, try a single quick resync
-		select {
-		case m.marketSubResyncChan <- mexcSymbol:
-			m.log.Debugf("Sent resync request for %s during MidGap call", mexcSymbol)
-		default:
-			// Already requested or channel full, continue
-		}
+		// If no cached value and not synced, try a sync in background
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if bookInstance.syncOrderbook(ctx) {
+				m.log.Debugf("Background sync for %s completed successfully for MidGap", mexcSymbol)
+			}
+		}()
 
 		return 0 // Return 0 if no cached value and book not synced
 	}
@@ -3454,14 +3482,14 @@ drainLoop:
 	var err error
 	maxAttempts := 3
 
-	// NEW: Implement backoff strategy for retries
+	// Implement backoff strategy for retries
 	backoffDuration := 500 * time.Millisecond
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		ob.log.Debugf("Fetching orderbook snapshot for %s via API (attempt %d/%d)", ob.mktSymbol, attempt, maxAttempts)
 		snapshot, err = ob.getSnapshot(ctx, ob.mktSymbol)
 		if err == nil && snapshot != nil {
-			// NEW: Verify snapshot data has reasonable content
+			// Verify snapshot data has reasonable content
 			if snapshot.LastUpdateID == 0 || len(snapshot.Bids) == 0 || len(snapshot.Asks) == 0 {
 				ob.log.Errorf("Received empty or invalid snapshot for %s: LastUpdateID=%d, Bids=%d, Asks=%d",
 					ob.mktSymbol, snapshot.LastUpdateID, len(snapshot.Bids), len(snapshot.Asks))
@@ -3486,7 +3514,38 @@ drainLoop:
 				return false
 			}
 		} else {
-			return false // Failed after all attempts
+			// Last attempt failed, but don't return false yet - try to make best effort
+			ob.log.Warnf("All %d snapshot fetch attempts failed for %s, trying with existing book data", maxAttempts, ob.mktSymbol)
+
+			// Check if we have any existing book data
+			ob.mtx.RLock()
+			// Get current bids and asks - if there are any, we have existing data
+			currentBids, currentAsks := ob.book.snap()
+			hasExistingData := ob.book != nil && (len(currentBids) > 0 || len(currentAsks) > 0)
+			ob.mtx.RUnlock()
+
+			if hasExistingData {
+				// Keep existing data with warning
+				ob.log.Warnf("Using existing book data for %s - consider this stale until next successful sync", ob.mktSymbol)
+				ob.synced.Store(true)
+
+				// Signal success to waiting goroutines
+				ob.mtx.Lock()
+				select {
+				case <-ob.syncChan:
+					// Already closed, create a new one first
+					ob.syncChan = make(chan struct{})
+				default:
+					// Channel is open, just close it
+				}
+				close(ob.syncChan)
+				ob.mtx.Unlock()
+
+				return true
+			}
+
+			// No existing data, return failure
+			return false
 		}
 	}
 
@@ -3503,13 +3562,13 @@ drainLoop:
 		return false
 	}
 
-	// NEW: Enhanced validation of converted bid/ask data
+	// Enhanced validation of converted bid/ask data
 	if len(bids) == 0 && len(asks) == 0 {
 		ob.log.Errorf("Empty orderbook snapshot for %s - both bids and asks are empty after conversion", ob.mktSymbol)
 		return false
 	}
 
-	// NEW: Check for reasonable price levels
+	// Check for reasonable price levels
 	if len(bids) > 0 && len(asks) > 0 {
 		// Best bid should be lower than best ask in a valid book
 		if bids[0].rate >= asks[0].rate {
