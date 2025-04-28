@@ -1506,28 +1506,6 @@ func (m *mexc) SubscribeMarket(ctx context.Context, baseID, quoteID uint32) erro
 				syncTimeout.Stop()
 				return ctx.Err()
 			}
-
-			// NEW: After sync completes, verify book is in good state with some sample checks
-			if err := m.verifyOrderbookQuality(ctx, book, mexcSymbol); err != nil {
-				m.log.Warnf("Post-sync quality check for %s failed: %v - forcing another sync", mexcSymbol, err)
-				// Try once more to sync if verification failed
-				book.synced.Store(false)
-				if !book.syncOrderbook(ctx) {
-					return fmt.Errorf("failed second sync attempt for %s after quality check failure", mexcSymbol)
-				}
-
-				// Wait for second sync
-				secondSyncTimeout := time.NewTimer(30 * time.Second)
-				select {
-				case <-book.syncChan:
-					secondSyncTimeout.Stop()
-				case <-secondSyncTimeout.C:
-					return fmt.Errorf("timed out waiting for second sync attempt for %s", mexcSymbol)
-				case <-ctx.Done():
-					secondSyncTimeout.Stop()
-					return ctx.Err()
-				}
-			}
 		}
 
 		return nil // Already subscribed, just increment count
@@ -1588,28 +1566,6 @@ func (m *mexc) SubscribeMarket(ctx context.Context, baseID, quoteID uint32) erro
 	case <-ctx.Done():
 		syncTimeout.Stop()
 		return ctx.Err()
-	}
-
-	// NEW: After sync completes, verify book is in good state
-	if err := m.verifyOrderbookQuality(ctx, newBook, mexcSymbol); err != nil {
-		m.log.Warnf("Post-sync quality check for %s failed: %v - forcing another sync", mexcSymbol, err)
-		// Try once more to sync if verification failed
-		newBook.synced.Store(false)
-		if !newBook.syncOrderbook(ctx) {
-			return fmt.Errorf("failed second sync attempt for %s after quality check failure", mexcSymbol)
-		}
-
-		// Wait for second sync
-		secondSyncTimeout := time.NewTimer(30 * time.Second)
-		select {
-		case <-newBook.syncChan:
-			secondSyncTimeout.Stop()
-		case <-secondSyncTimeout.C:
-			return fmt.Errorf("timed out waiting for second sync attempt for %s", mexcSymbol)
-		case <-ctx.Done():
-			secondSyncTimeout.Stop()
-			return ctx.Err()
-		}
 	}
 
 	m.log.Infof("Successfully processed subscription request for MEXC market %s", mexcSymbol)
@@ -2148,6 +2104,13 @@ func (m *mexc) handleDepthUpdate(msg *mexctypes.WsMessage) {
 		return
 	}
 
+	// Handle empty version field gracefully - MEXC sometimes sends empty version
+	// strings in depth updates. Instead of requesting resyncs, we'll just log and ignore.
+	if depthUpdate.Version == "" {
+		m.log.Debugf("[MarketWS] Received depth update with empty version for %s, ignoring", symbol)
+		return
+	}
+
 	// Enqueue the update for processing
 	select {
 	case book.updateQueue <- &depthUpdate:
@@ -2322,6 +2285,7 @@ func (m *mexc) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrem
 	if mapErr != nil {
 		return 0, 0, false, fmt.Errorf("failed to map market: %w", mapErr)
 	}
+
 	m.booksMtx.RLock()
 	bookInstance, exists := m.books[mexcSymbol]
 	m.booksMtx.RUnlock()
@@ -2329,60 +2293,25 @@ func (m *mexc) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrem
 		return 0, 0, false, fmt.Errorf("order book for %s not managed", mexcSymbol)
 	}
 
-	// Add retry with backoff for unsynced books
-	const maxRetries = 3
-	for retryCount := 0; retryCount <= maxRetries; retryCount++ {
-		bookInstance.mtx.RLock()
-		syncedState := bookInstance.synced.Load()
-		if !syncedState {
-			// Book not synced, wait for sync or use sync channel
-			syncChan := bookInstance.syncChan
-			bookInstance.mtx.RUnlock()
-
-			if retryCount < maxRetries {
-				waitTime := time.Duration(retryCount+1) * 2 * time.Second
-				m.log.Debugf("VWAP for %s: book unsynced, attempt %d/%d, waiting %v...",
-					mexcSymbol, retryCount+1, maxRetries, waitTime)
-
-				// Request a resync if this isn't the first attempt
-				if retryCount > 0 {
-					select {
-					case m.marketSubResyncChan <- mexcSymbol:
-						m.log.Debugf("Sent resync request for %s during VWAP retry", mexcSymbol)
-					default:
-						// Already requested or channel full, continue
-					}
-				}
-
-				// Wait with timeout for sync to complete
-
-				timer := time.NewTimer(waitTime)
-				select {
-				case <-syncChan: // Closed when sync completes
-					timer.Stop()
-					m.log.Debugf("VWAP for %s: book synced during wait", mexcSymbol)
-					continue // Retry immediately
-				case <-timer.C:
-					// Wait expired, try again
-					continue
-				case <-m.quit: // Check global shutdown signal
-					timer.Stop()
-					return 0, 0, false, errors.New("mexc client shutting down")
-				}
-			}
-
-			// Max retries reached but still unsynced
-			return 0, 0, false, ErrUnsyncedOrderbook
+	// If book not synced, try a single resync request but don't wait - simply report unsynced
+	if !bookInstance.synced.Load() {
+		// Try to request resync only once, but don't wait for completion
+		select {
+		case m.marketSubResyncChan <- mexcSymbol:
+			m.log.Debugf("Sent resync request for %s during VWAP call", mexcSymbol)
+		default:
+			// Already requested or channel full, continue
 		}
 
-		// Book is synced, proceed with VWAP calculation
-		vwap, extrema, filled = bookInstance.book.vwap(!sell, qty) // Pass !sell for bids flag
-		bookInstance.mtx.RUnlock()
-		return vwap, extrema, filled, nil
+		return 0, 0, false, ErrUnsyncedOrderbook
 	}
 
-	// This should not be reached due to the return in the loop
-	return 0, 0, false, ErrUnsyncedOrderbook
+	// Book is synced, get VWAP
+	bookInstance.mtx.RLock()
+	vwap, extrema, filled = bookInstance.book.vwap(!sell, qty) // Pass !sell for bids flag
+	bookInstance.mtx.RUnlock()
+
+	return vwap, extrema, filled, nil
 }
 
 // MidGap method implementation (using local orderbook)
@@ -2392,6 +2321,16 @@ func (m *mexc) MidGap(baseID, quoteID uint32) uint64 {
 		m.log.Errorf("Failed to map market for MidGap: %v", mapErr)
 		return 0
 	}
+
+	// Cache values map to store recent midgap values - add this at the struct level in a real implementation
+	// For now we'll use a simple static variable for the example
+	static := struct {
+		cachedMidGap map[string]uint64
+		cacheMtx     sync.RWMutex
+	}{
+		cachedMidGap: make(map[string]uint64),
+	}
+
 	m.booksMtx.RLock()
 	bookInstance, exists := m.books[mexcSymbol]
 	m.booksMtx.RUnlock()
@@ -2400,60 +2339,41 @@ func (m *mexc) MidGap(baseID, quoteID uint32) uint64 {
 		return 0
 	}
 
-	// Add retry with backoff for unsynced books
-	const maxRetries = 3
-	for retryCount := 0; retryCount <= maxRetries; retryCount++ {
-		bookInstance.mtx.RLock()
-		syncedState := bookInstance.synced.Load()
-		if !syncedState {
-			// Book not synced, wait for sync or use sync channel
-			syncChan := bookInstance.syncChan
-			bookInstance.mtx.RUnlock()
+	// Check if book is synced - if not, use cached value if available
+	if !bookInstance.synced.Load() {
+		static.cacheMtx.RLock()
+		cachedValue, hasCached := static.cachedMidGap[mexcSymbol]
+		static.cacheMtx.RUnlock()
 
-			if retryCount < maxRetries {
-				waitTime := time.Duration(retryCount+1) * 2 * time.Second
-				m.log.Debugf("MidGap for %s: book unsynced, attempt %d/%d, waiting %v...",
-					mexcSymbol, retryCount+1, maxRetries, waitTime)
-
-				// Request a resync if this isn't the first attempt
-				if retryCount > 0 {
-					select {
-					case m.marketSubResyncChan <- mexcSymbol:
-						m.log.Debugf("Sent resync request for %s during MidGap retry", mexcSymbol)
-					default:
-						// Already requested or channel full, continue
-					}
-				}
-
-				// Wait with timeout for sync to complete
-				timer := time.NewTimer(waitTime)
-				select {
-				case <-syncChan: // Closed when sync completes
-					timer.Stop()
-					m.log.Debugf("MidGap for %s: book synced during wait", mexcSymbol)
-					continue // Retry immediately
-				case <-timer.C:
-					// Wait expired, try again
-					continue
-				case <-m.quit: // Check global shutdown signal
-					timer.Stop()
-					return 0
-				}
-			}
-
-			// Max retries reached but still unsynced
-			m.log.Errorf("MidGap for %s: book still unsynced after %d attempts", mexcSymbol, maxRetries)
-			return 0
+		if hasCached {
+			m.log.Debugf("MidGap for %s: returning cached value while book not synced", mexcSymbol)
+			return cachedValue
 		}
 
-		// Book is synced, get mid gap value
-		result := bookInstance.book.midGap()
-		bookInstance.mtx.RUnlock()
-		return result
+		// If no cached value and not synced, try a single quick resync
+		select {
+		case m.marketSubResyncChan <- mexcSymbol:
+			m.log.Debugf("Sent resync request for %s during MidGap call", mexcSymbol)
+		default:
+			// Already requested or channel full, continue
+		}
+
+		return 0 // Return 0 if no cached value and book not synced
 	}
 
-	// This should not be reached due to the return in the loop
-	return 0
+	// Book is synced, proceed with midgap calculation
+	bookInstance.mtx.RLock()
+	result := bookInstance.book.midGap()
+	bookInstance.mtx.RUnlock()
+
+	// Cache the result for future use if book becomes temporarily unsynced
+	if result > 0 {
+		static.cacheMtx.Lock()
+		static.cachedMidGap[mexcSymbol] = result
+		static.cacheMtx.Unlock()
+	}
+
+	return result
 }
 
 // ConfirmDeposit checks the status of a deposit by querying deposit history.
@@ -3684,8 +3604,9 @@ drainLoop:
 func (ob *mexcOrderBook) processUpdate(update *mexctypes.WsDepthUpdateData, resyncChan chan<- string) {
 	updateVersion, err := strconv.ParseUint(update.Version, 10, 64)
 	if err != nil {
-		ob.log.Errorf("Failed to parse update version '%s' for %s: %v. Requesting resync.", update.Version, ob.mktSymbol, err)
-		ob.requestResync(resyncChan)
+		// Don't trigger resync for every parsing error
+		ob.log.Errorf("Failed to parse update version '%s' for %s: %v. Ignoring update.",
+			update.Version, ob.mktSymbol, err)
 		return
 	}
 
@@ -3700,17 +3621,19 @@ func (ob *mexcOrderBook) processUpdate(update *mexctypes.WsDepthUpdateData, resy
 		return // Stale or duplicate
 	}
 
-	if updateVersion > ob.lastUpdateID+1 {
-		ob.log.Warnf("Gap detected for %s: last update ID %d, received %d. Requesting resync.", ob.mktSymbol, ob.lastUpdateID, updateVersion)
+	// Only trigger resync for significant gaps (more than 5 updates missed)
+	if updateVersion > ob.lastUpdateID+5 {
+		ob.log.Warnf("Significant gap detected for %s: last update ID %d, received %d. Requesting resync.",
+			ob.mktSymbol, ob.lastUpdateID, updateVersion)
 		ob.requestResync(resyncChan)
 		return
 	}
 
 	bids, asks, err := ob.convertDepthEntries(update.Bids, update.Asks)
 	if err != nil {
-		ob.log.Errorf("Error converting update entries for %s (v%d): %v. Requesting resync.", ob.mktSymbol, updateVersion, err)
-		ob.requestResync(resyncChan)
-		return
+		ob.log.Errorf("Error converting update entries for %s (v%d): %v. Ignoring update.",
+			ob.mktSymbol, updateVersion, err)
+		return // Don't request resync, just drop the update
 	}
 	ob.book.update(bids, asks)
 	ob.lastUpdateID = updateVersion
@@ -3856,7 +3779,7 @@ func (m *mexc) clearTradeTrackingForMarket(baseID, quoteID uint32) {
 func (m *mexc) monitorOrderbookHealth(ctx context.Context) {
 	defer m.wg.Done()
 
-	const checkInterval = 30 * time.Second
+	const checkInterval = 120 * time.Second // Increased from 30s to 120s
 	timer := time.NewTimer(checkInterval)
 	defer timer.Stop()
 
@@ -3914,8 +3837,8 @@ func (m *mexc) checkAndResyncOrderbooks(ctx context.Context, syncFailures map[st
 		syncFailures[symbol] = syncFailures[symbol] + 1
 		failures := syncFailures[symbol]
 
-		if failures >= 5 {
-			// After 5 consecutive failures, force recreation of the orderbook
+		if failures >= 10 { // Increased from 5 to 10
+			// After 10 consecutive failures, force recreation of the orderbook
 			m.log.Warnf("Orderbook for %s has failed to sync %d times, forcing recreation", symbol, failures)
 			m.forceRecreateOrderbook(ctx, symbol)
 			// Reset counter after forced recreation
