@@ -43,6 +43,15 @@ const (
 // Ensure mexc implements the CEX interface.
 var _ CEX = (*mexc)(nil)
 
+// CleanShutdown interface defines methods for clean bot shutdown
+type CleanShutdown interface {
+	// CleanBotShutdown performs a clean shutdown of bot-specific resources for a specific market
+	CleanBotShutdown(ctx context.Context, baseID, quoteID uint32) error
+}
+
+// Ensure mexc implements the CleanShutdown interface
+var _ CleanShutdown = (*mexc)(nil)
+
 // tradeInfo stores details needed to update a trade via websocket/polling.
 // Ensure only one definition exists.
 type mexcTradeInfo struct {
@@ -124,20 +133,21 @@ type mexc struct {
 
 // mexcOrderBook struct definition
 type mexcOrderBook struct {
-	mtx            sync.RWMutex
-	synced         atomic.Bool
-	syncChan       chan struct{} // Closed when initial sync completes
-	stopChan       chan struct{} // Closed to signal run loop exit
-	numSubscribers uint32
-	getSnapshot    func(ctx context.Context, symbol string) (*mexctypes.DepthResponse, error)
-	book           *orderbook // Use local type
-	updateQueue    chan *mexctypes.WsDepthUpdateData
-	mktSymbol      string
-	baseFactor     uint64
-	quoteFactor    uint64
-	log            dex.Logger
-	lastUpdateID   uint64    // Use uint64 for comparison
-	connectedChan  chan bool // Channel to communicate connection status changes
+	mtx              sync.RWMutex
+	synced           atomic.Bool
+	syncChan         chan struct{} // Closed when initial sync completes
+	stopChan         chan struct{} // Closed to signal run loop exit
+	numSubscribers   uint32
+	getSnapshot      func(ctx context.Context, symbol string) (*mexctypes.DepthResponse, error)
+	book             *orderbook // Use local type
+	updateQueue      chan *mexctypes.WsDepthUpdateData
+	mktSymbol        string
+	baseFactor       uint64
+	quoteFactor      uint64
+	log              dex.Logger
+	lastUpdateID     uint64    // Use uint64 for comparison
+	connectedChan    chan bool // Channel to communicate connection status changes
+	requireFreshSync bool      // When true, force a fresh sync on resubscribe
 }
 
 // newMEXC constructor (Configure RawHandler)
@@ -1430,6 +1440,17 @@ func (m *mexc) SubscribeMarket(ctx context.Context, baseID, quoteID uint32) erro
 	// 2. Handle order book instance management
 	m.booksMtx.Lock()
 	book, exists := m.books[mexcSymbol]
+
+	// Check if book exists but needs fresh sync (after bot restart)
+	if exists && book.requireFreshSync {
+		m.log.Infof("Found existing orderbook for %s marked for fresh sync, recreating it", mexcSymbol)
+		// Stop the existing book's run goroutine
+		book.stop()
+		// Delete it from the map to force recreation
+		delete(m.books, mexcSymbol)
+		exists = false
+	}
+
 	if exists {
 		m.log.Infof("Found existing orderbook for %s, checking sync status", mexcSymbol)
 		book.mtx.Lock()
@@ -3223,16 +3244,17 @@ func newMEXCOrderBook(
 	getSnapshotFunc func(ctx context.Context, symbol string) (*mexctypes.DepthResponse, error),
 ) *mexcOrderBook {
 	return &mexcOrderBook{
-		mktSymbol:     mktSymbol,
-		baseFactor:    baseFactor,
-		quoteFactor:   quoteFactor,
-		log:           log,
-		getSnapshot:   getSnapshotFunc,
-		book:          newOrderBook(),
-		updateQueue:   make(chan *mexctypes.WsDepthUpdateData, 256), // Buffered queue
-		syncChan:      make(chan struct{}),                          // Unclosed initially
-		stopChan:      make(chan struct{}),                          // For stopping the run goroutine
-		connectedChan: make(chan bool),                              // Channel to communicate connection status changes
+		mktSymbol:        mktSymbol,
+		baseFactor:       baseFactor,
+		quoteFactor:      quoteFactor,
+		log:              log,
+		getSnapshot:      getSnapshotFunc,
+		book:             newOrderBook(),
+		updateQueue:      make(chan *mexctypes.WsDepthUpdateData, 256), // Buffered queue
+		syncChan:         make(chan struct{}),                          // Unclosed initially
+		stopChan:         make(chan struct{}),                          // For stopping the run goroutine
+		connectedChan:    make(chan bool),                              // Channel to communicate connection status changes
+		requireFreshSync: false,
 	}
 }
 
@@ -3467,4 +3489,76 @@ func (ob *mexcOrderBook) convertDepthEntries(mexcBids, mexcAsks [][2]json.Number
 		return nil, nil, fmt.Errorf("asks: %w", err)
 	}
 	return bids, asks, nil
+}
+
+// CleanBotShutdown performs a clean shutdown of bot-specific resources for a specific market.
+// This should be called when the bot is stopped from the frontend.
+func (m *mexc) CleanBotShutdown(ctx context.Context, baseID, quoteID uint32) error {
+	m.log.Infof("Performing clean bot shutdown for market %d/%d...", baseID, quoteID)
+
+	// 1. Convert baseID/quoteID to MEXC symbol
+	mexcSymbol, err := m.mapDEXIDsToMEXCSymbol(baseID, quoteID)
+	if err != nil {
+		m.log.Warnf("Could not map market %d/%d to MEXC symbol: %v", baseID, quoteID, err)
+		// Continue with cleanup even if we can't map the symbol
+	} else {
+		// 2. Unsubscribe from this specific market
+		err = m.UnsubscribeMarket(baseID, quoteID)
+		if err != nil {
+			m.log.Warnf("Error unsubscribing from market %d/%d: %v", baseID, quoteID, err)
+			// Continue with cleanup even if unsubscribe fails
+		}
+
+		// 3. Mark this specific book as requiring fresh sync on restart
+		m.booksMtx.Lock()
+		if book, exists := m.books[mexcSymbol]; exists {
+			book.requireFreshSync = true
+			book.synced.Store(false)
+			m.log.Infof("Marked book for %s as requiring fresh sync on restart", mexcSymbol)
+		}
+		m.booksMtx.Unlock()
+	}
+
+	// 4. Clear trade tracking state for this market pair
+	m.clearTradeTrackingForMarket(baseID, quoteID)
+
+	// 5. Cancel any active trades for this market pair
+	m.activeTradesMtx.RLock()
+	marketTradeIDs := make([]string, 0)
+	for tradeID, tradeInfo := range m.activeTrades {
+		if tradeInfo.baseID == baseID && tradeInfo.quoteID == quoteID {
+			marketTradeIDs = append(marketTradeIDs, tradeID)
+		}
+	}
+	m.activeTradesMtx.RUnlock()
+
+	for _, tradeID := range marketTradeIDs {
+		if err := m.CancelTrade(ctx, baseID, quoteID, tradeID); err != nil {
+			m.log.Warnf("Error canceling trade %s during shutdown: %v", tradeID, err)
+		} else {
+			m.log.Infof("Successfully canceled trade %s during shutdown", tradeID)
+		}
+	}
+
+	m.log.Infof("Bot shutdown completed successfully for market %d/%d", baseID, quoteID)
+	return nil
+}
+
+// clearTradeTrackingForMarket clears trade tracking state for a specific market pair.
+// This should be called when a bot for a specific market is stopped.
+func (m *mexc) clearTradeTrackingForMarket(baseID, quoteID uint32) {
+	// Clear active trades for this specific market pair
+	m.activeTradesMtx.Lock()
+	// Find and remove trades for this market
+	for tradeID, tradeInfo := range m.activeTrades {
+		if tradeInfo.baseID == baseID && tradeInfo.quoteID == quoteID {
+			delete(m.activeTrades, tradeID)
+		}
+	}
+	m.activeTradesMtx.Unlock()
+
+	// We don't clear trade updater subscriptions as they might be shared
+	// If needed, individual subscribers should manage their own unsubscribe
+
+	m.log.Infof("Cleared trade tracking for market %d/%d", baseID, quoteID)
 }
