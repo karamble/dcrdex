@@ -1506,6 +1506,28 @@ func (m *mexc) SubscribeMarket(ctx context.Context, baseID, quoteID uint32) erro
 				syncTimeout.Stop()
 				return ctx.Err()
 			}
+
+			// NEW: After sync completes, verify book is in good state with some sample checks
+			if err := m.verifyOrderbookQuality(ctx, book, mexcSymbol); err != nil {
+				m.log.Warnf("Post-sync quality check for %s failed: %v - forcing another sync", mexcSymbol, err)
+				// Try once more to sync if verification failed
+				book.synced.Store(false)
+				if !book.syncOrderbook(ctx) {
+					return fmt.Errorf("failed second sync attempt for %s after quality check failure", mexcSymbol)
+				}
+
+				// Wait for second sync
+				secondSyncTimeout := time.NewTimer(30 * time.Second)
+				select {
+				case <-book.syncChan:
+					secondSyncTimeout.Stop()
+				case <-secondSyncTimeout.C:
+					return fmt.Errorf("timed out waiting for second sync attempt for %s", mexcSymbol)
+				case <-ctx.Done():
+					secondSyncTimeout.Stop()
+					return ctx.Err()
+				}
+			}
 		}
 
 		return nil // Already subscribed, just increment count
@@ -1566,6 +1588,28 @@ func (m *mexc) SubscribeMarket(ctx context.Context, baseID, quoteID uint32) erro
 	case <-ctx.Done():
 		syncTimeout.Stop()
 		return ctx.Err()
+	}
+
+	// NEW: After sync completes, verify book is in good state
+	if err := m.verifyOrderbookQuality(ctx, newBook, mexcSymbol); err != nil {
+		m.log.Warnf("Post-sync quality check for %s failed: %v - forcing another sync", mexcSymbol, err)
+		// Try once more to sync if verification failed
+		newBook.synced.Store(false)
+		if !newBook.syncOrderbook(ctx) {
+			return fmt.Errorf("failed second sync attempt for %s after quality check failure", mexcSymbol)
+		}
+
+		// Wait for second sync
+		secondSyncTimeout := time.NewTimer(30 * time.Second)
+		select {
+		case <-newBook.syncChan:
+			secondSyncTimeout.Stop()
+		case <-secondSyncTimeout.C:
+			return fmt.Errorf("timed out waiting for second sync attempt for %s", mexcSymbol)
+		case <-ctx.Done():
+			secondSyncTimeout.Stop()
+			return ctx.Err()
+		}
 	}
 
 	m.log.Infof("Successfully processed subscription request for MEXC market %s", mexcSymbol)
@@ -1983,7 +2027,27 @@ func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol strin
 		return fmt.Errorf("market stream not connected when trying to subscribe to %s", mexcSymbol)
 	}
 
+	// Check if this symbol is already subscribed at MEXC's end (not just our tracking)
+	// We'll need to handle this by force unsubscribing first
+	// This helps with bot restart scenarios where MEXC might still have active subscriptions
 	channel := fmt.Sprintf("spot@public.increase.depth.v3.api@%s", mexcSymbol)
+
+	// First try to unsubscribe to clear any potential existing subscription
+	m.log.Debugf("[MarketWS] Sending UNSUBSCRIPTION first to clear any existing subscription for %s", mexcSymbol)
+	unsubReq := mexctypes.WsRequest{
+		Method: "UNSUBSCRIPTION",
+		Params: []string{channel},
+	}
+	unsubBytes, marshalErr := json.Marshal(unsubReq)
+	if marshalErr == nil {
+		// Don't check for errors, as it might not have been subscribed
+		_ = m.marketStream.SendRaw(unsubBytes)
+		// Small delay to ensure unsubscribe is processed
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Now subscribe (fresh subscription)
+	m.log.Debugf("[MarketWS] Sending SUBSCRIPTION for %s", mexcSymbol)
 	req := mexctypes.WsRequest{
 		Method: "SUBSCRIPTION",
 		Params: []string{channel},
@@ -1993,7 +2057,6 @@ func (m *mexc) subscribeToAdditionalMarket(ctx context.Context, mexcSymbol strin
 		return fmt.Errorf("failed to marshal market subscription request for %s: %w", mexcSymbol, marshalErr)
 	}
 
-	m.log.Debugf("[MarketWS] Sending SUBSCRIPTION for %s", mexcSymbol)
 	err := m.marketStream.SendRaw(reqBytes)
 	if err != nil {
 		// Log the error, WsConn might handle reconnect, but the sub likely failed for now.
@@ -2060,7 +2123,46 @@ func (m *mexc) handleMarketRawMessage(msgBytes []byte) {
 
 // handleDepthUpdate parses the data part of the depth update and forwards it.
 func (m *mexc) handleDepthUpdate(msg *mexctypes.WsMessage) {
-	// ... function body ...
+	var depthUpdate mexctypes.WsDepthUpdateData
+	if err := json.Unmarshal(msg.Data, &depthUpdate); err != nil {
+		m.log.Errorf("[MarketWS] Failed to unmarshal depth update data: %v", err)
+		return
+	}
+
+	// Extract symbol from channel
+	parts := strings.Split(msg.Channel, "@")
+	if len(parts) < 2 {
+		m.log.Errorf("[MarketWS] Invalid channel format for depth update: %s", msg.Channel)
+		return
+	}
+	symbol := msg.Symbol // Use Symbol field from message
+
+	// Find the corresponding order book
+	m.booksMtx.RLock()
+	book, exists := m.books[symbol]
+	m.booksMtx.RUnlock()
+
+	if !exists {
+		// This can happen if unsubscribe raced with an update
+		m.log.Tracef("[MarketWS] Received depth update for untracked symbol: %s", symbol)
+		return
+	}
+
+	// Enqueue the update for processing
+	select {
+	case book.updateQueue <- &depthUpdate:
+		// Update successfully queued
+	default:
+		// Queue is full, need to force a resync
+		book.synced.Store(false)
+		m.log.Warnf("[MarketWS] Update queue full for %s, forcing resync", symbol)
+		select {
+		case m.marketSubResyncChan <- symbol:
+			m.log.Debugf("[MarketWS] Sent resync request for %s due to full queue", symbol)
+		default:
+			m.log.Warnf("[MarketWS] Resync channel full for %s", symbol)
+		}
+	}
 }
 
 // resubscribeMarkets sends subscription messages for all currently tracked markets.
@@ -3470,12 +3572,52 @@ drainLoop:
 		ob.log.Debugf("Drained %d pending updates before sync for %s", drainedCount, ob.mktSymbol)
 	}
 
-	ob.log.Debugf("Fetching orderbook snapshot for %s via API", ob.mktSymbol)
-	snapshot, err := ob.getSnapshot(ctx, ob.mktSymbol)
-	if err != nil {
-		ob.log.Errorf("Error getting orderbook snapshot for %s: %v", ob.mktSymbol, err)
+	// Make multiple attempts for snapshot fetch in case of temporary issues
+	var snapshot *mexctypes.DepthResponse
+	var err error
+	maxAttempts := 3
+
+	// NEW: Implement backoff strategy for retries
+	backoffDuration := 500 * time.Millisecond
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ob.log.Debugf("Fetching orderbook snapshot for %s via API (attempt %d/%d)", ob.mktSymbol, attempt, maxAttempts)
+		snapshot, err = ob.getSnapshot(ctx, ob.mktSymbol)
+		if err == nil && snapshot != nil {
+			// NEW: Verify snapshot data has reasonable content
+			if snapshot.LastUpdateID == 0 || len(snapshot.Bids) == 0 || len(snapshot.Asks) == 0 {
+				ob.log.Errorf("Received empty or invalid snapshot for %s: LastUpdateID=%d, Bids=%d, Asks=%d",
+					ob.mktSymbol, snapshot.LastUpdateID, len(snapshot.Bids), len(snapshot.Asks))
+				err = fmt.Errorf("invalid snapshot: empty data")
+			} else {
+				break // Valid snapshot, exit retry loop
+			}
+		}
+
+		ob.log.Errorf("Error getting orderbook snapshot for %s (attempt %d/%d): %v",
+			ob.mktSymbol, attempt, maxAttempts, err)
+
+		if attempt < maxAttempts {
+			// Wait before retrying, with increasing backoff
+			select {
+			case <-ctx.Done():
+				return false // Context canceled
+			case <-time.After(backoffDuration):
+				// Continue to next attempt
+				backoffDuration *= 2 // Exponential backoff
+			case <-ob.stopChan:
+				return false
+			}
+		} else {
+			return false // Failed after all attempts
+		}
+	}
+
+	if snapshot == nil {
+		ob.log.Errorf("Failed to get valid snapshot for %s after %d attempts", ob.mktSymbol, maxAttempts)
 		return false
 	}
+
 	ob.log.Debugf("Successfully retrieved snapshot for %s with last update ID: %d", ob.mktSymbol, snapshot.LastUpdateID)
 
 	bids, asks, err := ob.convertDepthEntries(snapshot.Bids, snapshot.Asks)
@@ -3484,9 +3626,20 @@ drainLoop:
 		return false
 	}
 
+	// NEW: Enhanced validation of converted bid/ask data
 	if len(bids) == 0 && len(asks) == 0 {
-		ob.log.Errorf("Empty orderbook snapshot for %s - both bids and asks are empty", ob.mktSymbol)
+		ob.log.Errorf("Empty orderbook snapshot for %s - both bids and asks are empty after conversion", ob.mktSymbol)
 		return false
+	}
+
+	// NEW: Check for reasonable price levels
+	if len(bids) > 0 && len(asks) > 0 {
+		// Best bid should be lower than best ask in a valid book
+		if bids[0].rate >= asks[0].rate {
+			ob.log.Errorf("Invalid orderbook snapshot for %s - crossed prices: bid=%d, ask=%d",
+				ob.mktSymbol, bids[0].rate, asks[0].rate)
+			return false
+		}
 	}
 
 	snapshotVersion := uint64(snapshot.LastUpdateID)
@@ -3508,6 +3661,9 @@ drainLoop:
 		ob.mktSymbol, snapshotVersion, bidCount, askCount)
 
 	ob.synced.Store(true)
+
+	// Mark book as no longer requiring fresh sync once successfully synced
+	ob.requireFreshSync = false
 
 	// Signal completion by closing the syncChan
 	ob.mtx.Lock()
@@ -3612,14 +3768,36 @@ func (m *mexc) CleanBotShutdown(ctx context.Context, baseID, quoteID uint32) err
 		m.log.Warnf("Could not map market %d/%d to MEXC symbol: %v", baseID, quoteID, err)
 		// Continue with cleanup even if we can't map the symbol
 	} else {
-		// 2. Unsubscribe from this specific market
+		// 2. Explicitly unsubscribe from the WebSocket feed first
+		if m.marketStream != nil && !m.marketStream.IsDown() {
+			channel := fmt.Sprintf("spot@public.increase.depth.v3.api@%s", mexcSymbol)
+			unsubReq := mexctypes.WsRequest{
+				Method: "UNSUBSCRIPTION",
+				Params: []string{channel},
+			}
+			unsubBytes, marshalErr := json.Marshal(unsubReq)
+			if marshalErr != nil {
+				m.log.Warnf("Failed to marshal market unsubscription request for %s: %v", mexcSymbol, marshalErr)
+			} else {
+				// Send unsubscribe message regardless of local subscription status
+				m.log.Infof("[MarketWS] Explicitly unsubscribing from %s during bot shutdown", mexcSymbol)
+				if err := m.marketStream.SendRaw(unsubBytes); err != nil {
+					m.log.Warnf("Failed to send explicit unsubscription for %s: %v", mexcSymbol, err)
+				} else {
+					// Small delay to ensure the unsubscribe is processed
+					time.Sleep(500 * time.Millisecond)
+				}
+			}
+		}
+
+		// 3. Now use regular UnsubscribeMarket to update local state
 		err = m.UnsubscribeMarket(baseID, quoteID)
 		if err != nil {
 			m.log.Warnf("Error unsubscribing from market %d/%d: %v", baseID, quoteID, err)
 			// Continue with cleanup even if unsubscribe fails
 		}
 
-		// 3. Mark this specific book as requiring fresh sync on restart
+		// 4. Mark this specific book as requiring fresh sync on restart
 		m.booksMtx.Lock()
 		if book, exists := m.books[mexcSymbol]; exists {
 			book.requireFreshSync = true
@@ -3629,10 +3807,10 @@ func (m *mexc) CleanBotShutdown(ctx context.Context, baseID, quoteID uint32) err
 		m.booksMtx.Unlock()
 	}
 
-	// 4. Clear trade tracking state for this market pair
+	// 5. Clear trade tracking state for this market pair
 	m.clearTradeTrackingForMarket(baseID, quoteID)
 
-	// 5. Cancel any active trades for this market pair
+	// 6. Cancel any active trades for this market pair
 	m.activeTradesMtx.RLock()
 	marketTradeIDs := make([]string, 0)
 	for tradeID, tradeInfo := range m.activeTrades {
@@ -3682,6 +3860,9 @@ func (m *mexc) monitorOrderbookHealth(ctx context.Context) {
 	timer := time.NewTimer(checkInterval)
 	defer timer.Stop()
 
+	// Track consecutive sync failures per book
+	syncFailures := make(map[string]int)
+
 	m.log.Infof("Starting orderbook health monitor (Interval: %v)", checkInterval)
 	defer m.log.Infof("Stopping orderbook health monitor.")
 
@@ -3690,23 +3871,36 @@ func (m *mexc) monitorOrderbookHealth(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			m.checkAndResyncOrderbooks(ctx)
+			m.checkAndResyncOrderbooks(ctx, syncFailures)
 			timer.Reset(checkInterval)
 		}
 	}
 }
 
 // checkAndResyncOrderbooks checks all orderbooks and attempts to resync any that are unsynced.
-func (m *mexc) checkAndResyncOrderbooks(ctx context.Context) {
+func (m *mexc) checkAndResyncOrderbooks(ctx context.Context, syncFailures map[string]int) {
 	m.booksMtx.RLock()
 	unsyncedBooks := make([]string, 0)
+	allBooks := make(map[string]*mexcOrderBook)
+
 	for symbol, book := range m.books {
+		allBooks[symbol] = book
 		// Only check books that have active subscribers
 		if book.numSubscribers > 0 && !book.synced.Load() {
 			unsyncedBooks = append(unsyncedBooks, symbol)
 		}
 	}
 	m.booksMtx.RUnlock()
+
+	// Reset failure counter for successfully synced books
+	for symbol, book := range allBooks {
+		if book.synced.Load() {
+			if _, exists := syncFailures[symbol]; exists {
+				delete(syncFailures, symbol)
+				m.log.Debugf("Reset sync failure counter for %s (now synced)", symbol)
+			}
+		}
+	}
 
 	if len(unsyncedBooks) == 0 {
 		return // All books synced
@@ -3716,12 +3910,116 @@ func (m *mexc) checkAndResyncOrderbooks(ctx context.Context) {
 
 	// Try to resync each unsynced book
 	for _, symbol := range unsyncedBooks {
-		m.log.Infof("Attempting to resync unsynced orderbook: %s", symbol)
-		select {
-		case m.marketSubResyncChan <- symbol:
-			m.log.Debugf("Sent resync request for %s during health check", symbol)
-		default:
-			m.log.Warnf("Resync channel full, couldn't request resync for %s", symbol)
+		// Increment failure counter for this book
+		syncFailures[symbol] = syncFailures[symbol] + 1
+		failures := syncFailures[symbol]
+
+		if failures >= 5 {
+			// After 5 consecutive failures, force recreation of the orderbook
+			m.log.Warnf("Orderbook for %s has failed to sync %d times, forcing recreation", symbol, failures)
+			m.forceRecreateOrderbook(ctx, symbol)
+			// Reset counter after forced recreation
+			syncFailures[symbol] = 0
+		} else {
+			// Normal resync attempt
+			m.log.Infof("Attempting to resync unsynced orderbook: %s (failure count: %d)", symbol, failures)
+			select {
+			case m.marketSubResyncChan <- symbol:
+				m.log.Debugf("Sent resync request for %s during health check", symbol)
+			default:
+				m.log.Warnf("Resync channel full, couldn't request resync for %s", symbol)
+			}
 		}
 	}
+}
+
+// forceRecreateOrderbook recreates an orderbook from scratch.
+// This is a last resort for books that repeatedly fail to sync properly.
+func (m *mexc) forceRecreateOrderbook(ctx context.Context, symbol string) {
+	m.booksMtx.Lock()
+	book, exists := m.books[symbol]
+	if !exists {
+		m.booksMtx.Unlock()
+		m.log.Warnf("Cannot recreate non-existent orderbook: %s", symbol)
+		return
+	}
+
+	// Save subscriber count and other important details
+	numSubscribers := book.numSubscribers
+	baseFactor := book.baseFactor
+	quoteFactor := book.quoteFactor
+	getSnapshotFunc := book.getSnapshot
+	bookLog := book.log
+
+	// Stop and remove the old book
+	book.stop()
+	delete(m.books, symbol)
+	m.log.Infof("Removed stale orderbook for %s", symbol)
+
+	// Create a new book with the same parameters
+	newBook := newMEXCOrderBook(
+		symbol,
+		baseFactor,
+		quoteFactor,
+		bookLog,
+		getSnapshotFunc,
+	)
+	newBook.numSubscribers = numSubscribers
+	m.books[symbol] = newBook
+	m.booksMtx.Unlock()
+
+	// Start the new book's run goroutine
+	go newBook.run(ctx, m.marketSubResyncChan)
+
+	// Resubscribe to the WebSocket feed for this market
+	m.marketStreamMtx.Lock()
+	err := m.subscribeToAdditionalMarket(ctx, symbol)
+	m.marketStreamMtx.Unlock()
+
+	if err != nil {
+		m.log.Errorf("Failed to resubscribe to market %s after recreation: %v", symbol, err)
+		return
+	}
+
+	m.log.Infof("Successfully recreated orderbook for %s, waiting for sync", symbol)
+
+	// No need to wait for sync here - the next health check will verify if it worked
+}
+
+// verifyOrderbookQuality checks if the orderbook is in a good state after synchronization.
+func (m *mexc) verifyOrderbookQuality(ctx context.Context, book *mexcOrderBook, symbol string) error {
+	book.mtx.RLock()
+	defer book.mtx.RUnlock()
+
+	// Get a snapshot of the current order book
+	bids, asks := book.book.snap()
+
+	// Check if the order book has bids and asks
+	if len(bids) == 0 || len(asks) == 0 {
+		return fmt.Errorf("order book for %s has no bids or asks", symbol)
+	}
+
+	// We need at least top bid and ask for spread calculation
+	if len(bids) < 1 || len(asks) < 1 {
+		return fmt.Errorf("order book for %s has insufficient entries for spread calculation", symbol)
+	}
+
+	// Check if the spread is reasonable (bid should be < ask for a valid book)
+	// Note: rate is in the format of quote/base atoms, higher number means higher price
+	// For a proper book, highest bid (index 0) should be lower than lowest ask (index 0)
+	if bids[0].rate >= asks[0].rate {
+		return fmt.Errorf("invalid spread for %s: best bid (%d) >= best ask (%d)",
+			symbol, bids[0].rate, asks[0].rate)
+	}
+
+	// Check if there are a reasonable number of entries (arbitrary threshold)
+	const minEntries = 5 // Expect at least 5 price levels on each side
+	if len(bids) < minEntries || len(asks) < minEntries {
+		return fmt.Errorf("order book for %s has too few entries: bids=%d, asks=%d",
+			symbol, len(bids), len(asks))
+	}
+
+	m.log.Debugf("Order book quality check passed for %s: %d bids, %d asks",
+		symbol, len(bids), len(asks))
+	return nil
 }
