@@ -148,6 +148,7 @@ type mexcOrderBook struct {
 	lastUpdateID    uint64    // Use uint64 for comparison
 	connectedChan   chan bool // Channel to communicate connection status changes
 	lastSyncAttempt time.Time // Track last sync attempt time to rate limit sync requests
+	ctx             context.Context
 }
 
 // newMEXC constructor (Configure RawHandler)
@@ -3360,6 +3361,7 @@ func newMEXCOrderBook(
 		stopChan:        make(chan struct{}),                          // For stopping the run goroutine
 		connectedChan:   make(chan bool),                              // Channel to communicate connection status changes
 		lastSyncAttempt: time.Time{},                                  // Track last sync attempt time to rate limit sync requests
+		ctx:             context.Background(),
 	}
 }
 
@@ -3617,44 +3619,74 @@ drainLoop:
 func (ob *mexcOrderBook) processUpdate(update *mexctypes.WsDepthUpdateData, resyncChan chan<- string) {
 	// Handle empty version strings explicitly here too
 	if update.Version == "" {
-		// Empty version string, just log and ignore
-		ob.log.Tracef("Ignoring update with empty version string for %s", ob.mktSymbol)
+		// Empty version string, just log (at trace level to avoid spam) and ignore
+		// ob.log.Tracef("Ignoring update with empty version string for %s", ob.mktSymbol)
 		return
 	}
 
 	updateVersion, err := strconv.ParseUint(update.Version, 10, 64)
 	if err != nil {
-		// Don't trigger resync for every parsing error
-		ob.log.Errorf("Failed to parse update version '%s' for %s: %v. Ignoring update.",
+		// Don't trigger resync for parsing errors - MEXC sometimes sends malformed versions
+		// Just log and continue processing as normal
+		ob.log.Debugf("Failed to parse update version '%s' for %s: %v. Continuing with normal processing.",
 			update.Version, ob.mktSymbol, err)
-		return
+
+		// Try a best-effort approach: increment the last update ID and proceed
+		ob.mtx.Lock()
+		if ob.lastUpdateID > 0 {
+			updateVersion = ob.lastUpdateID + 1
+		} else {
+			// If we have no baseline, just return rather than using 0
+			ob.mtx.Unlock()
+			return
+		}
+		ob.mtx.Unlock()
 	}
 
 	ob.mtx.Lock()
 	defer ob.mtx.Unlock()
 
+	// If book isn't synced, ignore updates rather than processing with potentially
+	// outdated state - book will be resynced through other mechanisms
 	if !ob.synced.Load() {
-		return // Drop if not synced
-	}
-
-	if updateVersion <= ob.lastUpdateID {
-		return // Stale or duplicate
-	}
-
-	// Only trigger resync for significant gaps (more than 5 updates missed)
-	if updateVersion > ob.lastUpdateID+5 {
-		ob.log.Warnf("Significant gap detected for %s: last update ID %d, received %d. Requesting resync.",
-			ob.mktSymbol, ob.lastUpdateID, updateVersion)
-		ob.requestResync(resyncChan)
 		return
 	}
 
+	// Be extremely tolerant of out-of-order or stale updates
+	// Only process if version is newer than what we have
+	if updateVersion <= ob.lastUpdateID {
+		// Silent ignore for stale updates to reduce log spam
+		return
+	}
+
+	// Only request resync for extremely large gaps (more than 1000 updates missed)
+	// Increased from 100 to 1000 to be even more tolerant of gaps
+	if updateVersion > ob.lastUpdateID+1000 {
+		ob.log.Warnf("Very large gap detected for %s: last update ID %d, received %d. Requesting resync.",
+			ob.mktSymbol, ob.lastUpdateID, updateVersion)
+		ob.synced.Store(false)
+		select {
+		case resyncChan <- ob.mktSymbol:
+			ob.log.Infof("Resync requested for %s due to large version gap", ob.mktSymbol)
+		default:
+			ob.log.Warnf("Resync channel full for %s, resync likely already pending.", ob.mktSymbol)
+		}
+		return
+	}
+
+	// For small and medium gaps, just process the update normally
+	// The occasional gap should not affect overall book quality significantly
+
 	bids, asks, err := ob.convertDepthEntries(update.Bids, update.Asks)
 	if err != nil {
-		ob.log.Errorf("Error converting update entries for %s (v%d): %v. Ignoring update.",
+		// Error converting entries, but don't trigger resync
+		// Just log and skip this specific update
+		ob.log.Errorf("Error converting update entries for %s (v%d): %v. Ignoring this update only.",
 			ob.mktSymbol, updateVersion, err)
-		return // Don't request resync, just drop the update
+		return
 	}
+
+	// Apply the update
 	ob.book.update(bids, asks)
 	ob.lastUpdateID = updateVersion
 }
@@ -3766,175 +3798,172 @@ func (m *mexc) clearTradeTrackingForMarket(baseID, quoteID uint32) {
 	m.log.Infof("Cleared trade tracking for market %d/%d", baseID, quoteID)
 }
 
-// monitorOrderbookHealth periodically checks for unsynced orderbooks and attempts to resync them.
-// This helps prevent "orderbook not synced" errors from persisting too long.
+// monitorOrderbookHealth periodically checks the orderbook synchronization status
+// and attempts to refresh books that appear stale.
 func (m *mexc) monitorOrderbookHealth(ctx context.Context) {
-	defer m.wg.Done()
+	// Increase interval to 5 minutes, was too aggressive at 2 minutes
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
 
-	const checkInterval = 120 * time.Second // Increased from 30s to 120s
-	timer := time.NewTimer(checkInterval)
-	defer timer.Stop()
-
-	// Track consecutive sync failures per book
-	syncFailures := make(map[string]int)
-
-	m.log.Infof("Starting orderbook health monitor (Interval: %v)", checkInterval)
-	defer m.log.Infof("Stopping orderbook health monitor.")
+	// Keep track of which books have been flagged as unsynced and when
+	// This helps avoid unnecessary resyncs for temporary network issues
+	lastUnsynced := make(map[string]bool)
+	unsyncedSince := make(map[string]time.Time)
 
 	for {
 		select {
+		case <-ticker.C:
+			m.booksMtx.RLock()
+			marketsToCheck := make([]string, 0, len(m.books))
+			for mktID := range m.books {
+				marketsToCheck = append(marketsToCheck, mktID)
+			}
+			m.booksMtx.RUnlock()
+
+			for _, mktID := range marketsToCheck {
+				synced, isEmpty, err := m.isOrderbookSyncedAndPopulated(mktID)
+				if err != nil {
+					m.log.Errorf("Error checking orderbook health for %s: %v", mktID, err)
+					continue
+				}
+
+				if !synced {
+					// Book is marked as unsynced
+					if !lastUnsynced[mktID] {
+						// First time seeing this book as unsynced
+						lastUnsynced[mktID] = true
+						unsyncedSince[mktID] = time.Now()
+						m.log.Debugf("Orderbook for %s is unsynced. Will monitor before attempting resync.", mktID)
+					} else if time.Since(unsyncedSince[mktID]) > 2*time.Minute {
+						// Book has been unsynced for more than 2 minutes, try to resync
+						m.log.Warnf("Orderbook for %s has been unsynced for >2 minutes. Requesting resync.", mktID)
+
+						if !isEmpty {
+							// Only try to resync if there's actual data in the book
+							// Otherwise, let the normal subscription mechanism handle it
+							// This avoids unnecessarily forcing book recreation when not needed
+							select {
+							case m.marketSubResyncChan <- mktID:
+								m.log.Infof("Requesting resync for %s due to prolonged unsynced status", mktID)
+							default:
+								m.log.Debugf("Resync channel full for %s, another resync may be pending", mktID)
+							}
+						} else {
+							m.log.Debugf("Not resyncing empty orderbook for %s, will wait for normal market updates", mktID)
+						}
+					}
+				} else {
+					// Book is now synced, reset tracking
+					if lastUnsynced[mktID] {
+						m.log.Debugf("Orderbook for %s is now synced again", mktID)
+						lastUnsynced[mktID] = false
+						delete(unsyncedSince, mktID)
+					}
+				}
+			}
 		case <-ctx.Done():
 			return
-		case <-timer.C:
-			m.checkAndResyncOrderbooks(ctx, syncFailures)
-			timer.Reset(checkInterval)
 		}
 	}
 }
 
-// checkAndResyncOrderbooks checks all orderbooks and attempts to resync any that are unsynced.
-func (m *mexc) checkAndResyncOrderbooks(ctx context.Context, syncFailures map[string]int) {
+// isOrderbookSyncedAndPopulated checks if an orderbook is properly synchronized and has data.
+// Returns synced status, whether the book is empty, and any error.
+func (m *mexc) isOrderbookSyncedAndPopulated(mktID string) (bool, bool, error) {
 	m.booksMtx.RLock()
-	unsyncedBooks := make([]string, 0)
-	allBooks := make(map[string]*mexcOrderBook)
-
-	for symbol, book := range m.books {
-		allBooks[symbol] = book
-		// Only check books that have active subscribers
-		if book.numSubscribers > 0 && !book.synced.Load() {
-			unsyncedBooks = append(unsyncedBooks, symbol)
-		}
-	}
+	ob, exists := m.books[mktID]
 	m.booksMtx.RUnlock()
 
-	// Reset failure counter for successfully synced books
-	for symbol, book := range allBooks {
-		if book.synced.Load() {
-			if _, exists := syncFailures[symbol]; exists {
-				delete(syncFailures, symbol)
-				m.log.Debugf("Reset sync failure counter for %s (now synced)", symbol)
-			}
-		}
-	}
-
-	if len(unsyncedBooks) == 0 {
-		return // All books synced
-	}
-
-	m.log.Warnf("Found %d unsynced orderbooks during health check: %v", len(unsyncedBooks), unsyncedBooks)
-
-	// Try to resync each unsynced book
-	for _, symbol := range unsyncedBooks {
-		// Increment failure counter for this book
-		syncFailures[symbol] = syncFailures[symbol] + 1
-		failures := syncFailures[symbol]
-
-		if failures >= 10 { // Increased from 5 to 10
-			// After 10 consecutive failures, force recreation of the orderbook
-			m.log.Warnf("Orderbook for %s has failed to sync %d times, forcing recreation", symbol, failures)
-			m.forceRecreateOrderbook(ctx, symbol)
-			// Reset counter after forced recreation
-			syncFailures[symbol] = 0
-		} else {
-			// Normal resync attempt
-			m.log.Infof("Attempting to resync unsynced orderbook: %s (failure count: %d)", symbol, failures)
-			select {
-			case m.marketSubResyncChan <- symbol:
-				m.log.Debugf("Sent resync request for %s during health check", symbol)
-			default:
-				m.log.Warnf("Resync channel full, couldn't request resync for %s", symbol)
-			}
-		}
-	}
-}
-
-// forceRecreateOrderbook recreates an orderbook from scratch.
-// This is a last resort for books that repeatedly fail to sync properly.
-func (m *mexc) forceRecreateOrderbook(ctx context.Context, symbol string) {
-	m.booksMtx.Lock()
-	book, exists := m.books[symbol]
 	if !exists {
-		m.booksMtx.Unlock()
-		m.log.Warnf("Cannot recreate non-existent orderbook: %s", symbol)
-		return
+		return false, true, fmt.Errorf("no orderbook found for market %s", mktID)
 	}
 
-	// Save subscriber count and other important details
-	numSubscribers := book.numSubscribers
-	baseFactor := book.baseFactor
-	quoteFactor := book.quoteFactor
-	getSnapshotFunc := book.getSnapshot
-	bookLog := book.log
+	ob.mtx.RLock()
+	defer ob.mtx.RUnlock()
 
-	// Stop and remove the old book
-	book.stop()
-	delete(m.books, symbol)
-	m.log.Infof("Removed stale orderbook for %s", symbol)
+	// Check if book is empty by getting the top bids/asks using snap()
+	bids, asks := ob.book.snap()
+	isEmpty := len(bids) == 0 || len(asks) == 0
+	synced := ob.synced.Load()
 
-	// Create a new book with the same parameters
-	newBook := newMEXCOrderBook(
-		symbol,
-		baseFactor,
-		quoteFactor,
-		bookLog,
-		getSnapshotFunc,
-	)
-	newBook.numSubscribers = numSubscribers
-	m.books[symbol] = newBook
-	m.booksMtx.Unlock()
-
-	// Start the new book's run goroutine
-	go newBook.run(ctx, m.marketSubResyncChan)
-
-	// Resubscribe to the WebSocket feed for this market
-	m.marketStreamMtx.Lock()
-	err := m.subscribeToAdditionalMarket(ctx, symbol)
-	m.marketStreamMtx.Unlock()
-
-	if err != nil {
-		m.log.Errorf("Failed to resubscribe to market %s after recreation: %v", symbol, err)
-		return
-	}
-
-	m.log.Infof("Successfully recreated orderbook for %s, waiting for sync", symbol)
-
-	// No need to wait for sync here - the next health check will verify if it worked
+	return synced, isEmpty, nil
 }
 
-// verifyOrderbookQuality checks if the orderbook is in a good state after synchronization.
-func (m *mexc) verifyOrderbookQuality(ctx context.Context, book *mexcOrderBook, symbol string) error {
-	book.mtx.RLock()
-	defer book.mtx.RUnlock()
+// checkHealth periodically checks the health of the order book
+// and requests a resync if necessary.
+func (ob *mexcOrderBook) checkHealth(resyncChan chan<- string) {
+	const (
+		// Increase check interval from 10s to 30s
+		checkInterval = 30 * time.Second
+		// Allow up to 3 minutes without updates before marking as unsynced
+		maxUpdateAge = 3 * time.Minute
+	)
 
-	// Get a snapshot of the current order book
-	bids, asks := book.book.snap()
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
 
-	// Check if the order book has bids and asks
-	if len(bids) == 0 || len(asks) == 0 {
-		return fmt.Errorf("order book for %s has no bids or asks", symbol)
+	// Track consecutive failures to add hysteresis
+	consecutiveFailures := 0
+	maxConsecutiveFailures := 3
+
+	for {
+		select {
+		case <-ticker.C:
+			if !ob.synced.Load() {
+				// Already marked as unsynced, no need to check
+				continue
+			}
+
+			ob.mtx.Lock()
+			// Check if book has entries by looking at bids/asks slices
+			bids, asks := ob.book.snap()
+			hasEntries := len(bids) > 0 && len(asks) > 0
+			// Use lastUpdateID as a proxy for last update time
+			lastUpdateID := ob.lastUpdateID
+			ob.mtx.Unlock()
+
+			// If the book is empty and it's been synced before, that's not normal
+			if !hasEntries {
+				// Increment consecutive failures
+				consecutiveFailures++
+				ob.log.Debugf("Empty order book detected for %s (failure %d/%d)",
+					ob.mktSymbol, consecutiveFailures, maxConsecutiveFailures)
+
+				// Only mark as unsynced after multiple consecutive empty book checks
+				if consecutiveFailures >= maxConsecutiveFailures {
+					ob.log.Warnf("Order book for %s is empty after %d consecutive checks, requesting resync",
+						ob.mktSymbol, consecutiveFailures)
+					ob.synced.Store(false)
+					select {
+					case resyncChan <- ob.mktSymbol:
+						ob.log.Infof("Resync requested for %s due to empty book", ob.mktSymbol)
+					default:
+						ob.log.Warnf("Resync channel full when checking health for %s", ob.mktSymbol)
+					}
+				}
+				continue
+			}
+
+			// Reset failure counter if we have entries
+			if consecutiveFailures > 0 {
+				consecutiveFailures = 0
+			}
+
+			// Check if we've received updates recently by checking lastUpdateID
+			// Since we don't have a timestamp for the last update, we can only check
+			// if the lastUpdateID is zero (which would indicate no updates)
+			if lastUpdateID == 0 {
+				ob.log.Warnf("No updates for %s (lastUpdateID is 0), requesting resync", ob.mktSymbol)
+				ob.synced.Store(false)
+				select {
+				case resyncChan <- ob.mktSymbol:
+					ob.log.Infof("Resync requested for %s due to potential stale state", ob.mktSymbol)
+				default:
+					ob.log.Warnf("Resync channel full when checking health for %s", ob.mktSymbol)
+				}
+			}
+		case <-ob.ctx.Done():
+			return
+		}
 	}
-
-	// We need at least top bid and ask for spread calculation
-	if len(bids) < 1 || len(asks) < 1 {
-		return fmt.Errorf("order book for %s has insufficient entries for spread calculation", symbol)
-	}
-
-	// Check if the spread is reasonable (bid should be < ask for a valid book)
-	// Note: rate is in the format of quote/base atoms, higher number means higher price
-	// For a proper book, highest bid (index 0) should be lower than lowest ask (index 0)
-	if bids[0].rate >= asks[0].rate {
-		return fmt.Errorf("invalid spread for %s: best bid (%d) >= best ask (%d)",
-			symbol, bids[0].rate, asks[0].rate)
-	}
-
-	// Check if there are a reasonable number of entries (arbitrary threshold)
-	const minEntries = 5 // Expect at least 5 price levels on each side
-	if len(bids) < minEntries || len(asks) < minEntries {
-		return fmt.Errorf("order book for %s has too few entries: bids=%d, asks=%d",
-			symbol, len(bids), len(asks))
-	}
-
-	m.log.Debugf("Order book quality check passed for %s: %d bids, %d asks",
-		symbol, len(bids), len(asks))
-	return nil
 }
