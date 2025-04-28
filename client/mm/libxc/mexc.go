@@ -490,9 +490,10 @@ func (m *mexc) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	// m.startAccountDataPolling(ctx)
 
 	// Periodic background refresh tasks
-	m.wg.Add(2)
+	m.wg.Add(3) // Add one more for orderbook health monitor
 	go m.periodicExchangeInfoRefresh(ctx)
 	go m.periodicCoinInfoRefresh(ctx)
+	go m.monitorOrderbookHealth(ctx) // Add orderbook health monitoring
 
 	m.log.Infof("MEXC Connect sequence completed (Market stream connects on first subscription).")
 	m.log.Infof("Connect method attempting to return...")
@@ -2117,58 +2118,100 @@ func (m *mexc) Book(baseID, quoteID uint32) (buys, sells []*core.MiniOrder, _ er
 		return nil, nil, fmt.Errorf("order book for %s not managed", mexcSymbol)
 	}
 
-	bookInstance.mtx.RLock()
-	defer bookInstance.mtx.RUnlock()
+	// Add retry with backoff for unsynced books
+	const maxRetries = 3
+	for retryCount := 0; retryCount <= maxRetries; retryCount++ {
+		bookInstance.mtx.RLock()
+		syncedState := bookInstance.synced.Load()
+		if !syncedState {
+			// Book not synced, wait for sync or use sync channel
+			syncChan := bookInstance.syncChan
+			bookInstance.mtx.RUnlock()
 
-	if !bookInstance.synced.Load() {
-		return nil, nil, ErrUnsyncedOrderbook
-	}
+			if retryCount < maxRetries {
+				waitTime := time.Duration(retryCount+1) * 2 * time.Second
+				m.log.Debugf("Book for %s: book unsynced, attempt %d/%d, waiting %v...",
+					mexcSymbol, retryCount+1, maxRetries, waitTime)
 
-	// Get asset info for conversion factors
-	baseInfo, baseErr := asset.Info(baseID)
-	quoteInfo, quoteErr := asset.Info(quoteID)
-	if baseErr != nil || quoteErr != nil {
-		return nil, nil, fmt.Errorf("failed to get asset info for book conversion (base %d, quote %d): %w, %w", baseID, quoteID, baseErr, quoteErr)
-	}
-	baseFactor := float64(baseInfo.UnitInfo.Conventional.ConversionFactor)
-	quoteFactor := float64(quoteInfo.UnitInfo.Conventional.ConversionFactor)
-	if baseFactor == 0 || quoteFactor == 0 {
-		return nil, nil, fmt.Errorf("invalid conversion factor (base: %.0f, quote: %.0f) for market %d/%d", baseFactor, quoteFactor, baseID, quoteID)
-	}
+				// Request a resync if this isn't the first attempt
+				if retryCount > 0 {
+					select {
+					case m.marketSubResyncChan <- mexcSymbol:
+						m.log.Debugf("Sent resync request for %s during Book retry", mexcSymbol)
+					default:
+						// Already requested or channel full, continue
+					}
+				}
 
-	// Use the snap() method from orderbook.go
-	rawBids, rawAsks := bookInstance.book.snap() // Get bids/asks snapshot
+				// Wait with timeout for sync to complete
+				timer := time.NewTimer(waitTime)
+				select {
+				case <-syncChan: // Closed when sync completes
+					timer.Stop()
+					m.log.Debugf("Book for %s: book synced during wait", mexcSymbol)
+					continue // Retry immediately
+				case <-timer.C:
+					// Wait expired, try again
+					continue
+				case <-m.quit: // Check global shutdown signal
+					timer.Stop()
+					return nil, nil, errors.New("mexc client shutting down")
+				}
+			}
 
-	// Convert rawBids ([]*obEntry uint64) to buys ([]*core.MiniOrder float64)
-	buys = make([]*core.MiniOrder, len(rawBids))
-	for i, bid := range rawBids {
-		conventionalRate := (float64(bid.rate) / quoteFactor) * baseFactor // Convert atomic rate (q/b) to conventional rate
-		conventionalQty := float64(bid.qty) / baseFactor                   // Convert atomic base qty to conventional qty
-		buys[i] = &core.MiniOrder{
-			Rate:      conventionalRate, // Assign float64
-			Qty:       conventionalQty,  // Assign float64
-			QtyAtomic: bid.qty,          // Add atomic qty
-			MsgRate:   bid.rate,         // Add atomic rate
+			// Max retries reached but still unsynced
+			return nil, nil, ErrUnsyncedOrderbook
 		}
-	}
 
-	// Convert rawAsks ([]*obEntry uint64) to sells ([]*core.MiniOrder float64)
-	sells = make([]*core.MiniOrder, len(rawAsks))
-	for i, ask := range rawAsks {
-		conventionalRate := (float64(ask.rate) / quoteFactor) * baseFactor // Convert atomic rate (q/b) to conventional rate
-		conventionalQty := float64(ask.qty) / baseFactor                   // Convert atomic base qty to conventional qty
-		sells[i] = &core.MiniOrder{
-			Rate:      conventionalRate, // Assign float64
-			Qty:       conventionalQty,  // Assign float64
-			QtyAtomic: ask.qty,          // Add atomic qty
-			MsgRate:   ask.rate,         // Add atomic rate
+		// Get asset info for conversion factors
+		baseInfo, baseErr := asset.Info(baseID)
+		quoteInfo, quoteErr := asset.Info(quoteID)
+		if baseErr != nil || quoteErr != nil {
+			bookInstance.mtx.RUnlock()
+			return nil, nil, fmt.Errorf("failed to get asset info for book conversion (base %d, quote %d): %w, %w", baseID, quoteID, baseErr, quoteErr)
 		}
+		baseFactor := float64(baseInfo.UnitInfo.Conventional.ConversionFactor)
+		quoteFactor := float64(quoteInfo.UnitInfo.Conventional.ConversionFactor)
+		if baseFactor == 0 || quoteFactor == 0 {
+			bookInstance.mtx.RUnlock()
+			return nil, nil, fmt.Errorf("invalid conversion factor (base: %.0f, quote: %.0f) for market %d/%d", baseFactor, quoteFactor, baseID, quoteID)
+		}
+
+		// Use the snap() method from orderbook.go
+		rawBids, rawAsks := bookInstance.book.snap() // Get bids/asks snapshot
+		bookInstance.mtx.RUnlock()
+
+		// Convert rawBids ([]*obEntry uint64) to buys ([]*core.MiniOrder float64)
+		buys = make([]*core.MiniOrder, len(rawBids))
+		for i, bid := range rawBids {
+			conventionalRate := (float64(bid.rate) / quoteFactor) * baseFactor // Convert atomic rate (q/b) to conventional rate
+			conventionalQty := float64(bid.qty) / baseFactor                   // Convert atomic base qty to conventional qty
+			buys[i] = &core.MiniOrder{
+				Rate:      conventionalRate, // Assign float64
+				Qty:       conventionalQty,  // Assign float64
+				QtyAtomic: bid.qty,          // Add atomic qty
+				MsgRate:   bid.rate,         // Add atomic rate
+			}
+		}
+
+		// Convert rawAsks ([]*obEntry uint64) to sells ([]*core.MiniOrder float64)
+		sells = make([]*core.MiniOrder, len(rawAsks))
+		for i, ask := range rawAsks {
+			conventionalRate := (float64(ask.rate) / quoteFactor) * baseFactor // Convert atomic rate (q/b) to conventional rate
+			conventionalQty := float64(ask.qty) / baseFactor                   // Convert atomic base qty to conventional qty
+			sells[i] = &core.MiniOrder{
+				Rate:      conventionalRate, // Assign float64
+				Qty:       conventionalQty,  // Assign float64
+				QtyAtomic: ask.qty,          // Add atomic qty
+				MsgRate:   ask.rate,         // Add atomic rate
+			}
+		}
+
+		return buys, sells, nil
 	}
 
-	// Books are typically sorted best rate first. Ensure MiniOrder slices are sorted.
-	// The local orderbook implementation likely keeps them sorted.
-
-	return buys, sells, nil
+	// This should not be reached due to the return in the loop
+	return nil, nil, ErrUnsyncedOrderbook
 }
 
 // VWAP method implementation (using local orderbook)
@@ -2184,39 +2227,60 @@ func (m *mexc) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrem
 		return 0, 0, false, fmt.Errorf("order book for %s not managed", mexcSymbol)
 	}
 
-	bookInstance.mtx.RLock()
-	syncedState := bookInstance.synced.Load()
-	if !syncedState {
-		// Book not synced, wait briefly for initial sync to complete.
-		bookInstance.mtx.RUnlock()                                                                   // Unlock before waiting
-		m.log.Tracef("VWAP check for %s: book initially unsynced, waiting up to 20s...", mexcSymbol) // Increased timeout
-		timer := time.NewTimer(20 * time.Second)                                                     // Increased timeout
-		select {
-		case <-bookInstance.syncChan: // Closed when sync completes
-			timer.Stop()
-			bookInstance.mtx.RLock() // Re-acquire lock
-			syncedState = bookInstance.synced.Load()
-			m.log.Tracef("VWAP check for %s: syncChan closed, re-checking sync status = %v", mexcSymbol, syncedState)
-			if !syncedState {
-				bookInstance.mtx.RUnlock()
-				return 0, 0, false, ErrUnsyncedOrderbook // Still not synced after chan closed
-			}
-			// Proceed with synced book below
-		case <-timer.C:
-			m.log.Warnf("VWAP check for %s: timed out waiting for initial sync", mexcSymbol)
-			return 0, 0, false, ErrUnsyncedOrderbook // Timed out
-		case <-m.quit: // Check global shutdown signal
-			timer.Stop()
-			return 0, 0, false, errors.New("mexc client shutting down")
-		}
-		// If we got here via syncChan closing and syncedState is now true, RLock is held.
-	}
-	defer bookInstance.mtx.RUnlock() // Ensure unlock if we proceeded
+	// Add retry with backoff for unsynced books
+	const maxRetries = 3
+	for retryCount := 0; retryCount <= maxRetries; retryCount++ {
+		bookInstance.mtx.RLock()
+		syncedState := bookInstance.synced.Load()
+		if !syncedState {
+			// Book not synced, wait for sync or use sync channel
+			syncChan := bookInstance.syncChan
+			bookInstance.mtx.RUnlock()
 
-	// Use the local book's vwap method
-	vwap, extrema, filled = bookInstance.book.vwap(!sell, qty) // Pass !sell for bids flag
-	// Local vwap doesn't return error according to its definition in libxc/orderbook.go
-	return vwap, extrema, filled, nil // Added return
+			if retryCount < maxRetries {
+				waitTime := time.Duration(retryCount+1) * 2 * time.Second
+				m.log.Debugf("VWAP for %s: book unsynced, attempt %d/%d, waiting %v...",
+					mexcSymbol, retryCount+1, maxRetries, waitTime)
+
+				// Request a resync if this isn't the first attempt
+				if retryCount > 0 {
+					select {
+					case m.marketSubResyncChan <- mexcSymbol:
+						m.log.Debugf("Sent resync request for %s during VWAP retry", mexcSymbol)
+					default:
+						// Already requested or channel full, continue
+					}
+				}
+
+				// Wait with timeout for sync to complete
+
+				timer := time.NewTimer(waitTime)
+				select {
+				case <-syncChan: // Closed when sync completes
+					timer.Stop()
+					m.log.Debugf("VWAP for %s: book synced during wait", mexcSymbol)
+					continue // Retry immediately
+				case <-timer.C:
+					// Wait expired, try again
+					continue
+				case <-m.quit: // Check global shutdown signal
+					timer.Stop()
+					return 0, 0, false, errors.New("mexc client shutting down")
+				}
+			}
+
+			// Max retries reached but still unsynced
+			return 0, 0, false, ErrUnsyncedOrderbook
+		}
+
+		// Book is synced, proceed with VWAP calculation
+		vwap, extrema, filled = bookInstance.book.vwap(!sell, qty) // Pass !sell for bids flag
+		bookInstance.mtx.RUnlock()
+		return vwap, extrema, filled, nil
+	}
+
+	// This should not be reached due to the return in the loop
+	return 0, 0, false, ErrUnsyncedOrderbook
 }
 
 // MidGap method implementation (using local orderbook)
@@ -2234,14 +2298,60 @@ func (m *mexc) MidGap(baseID, quoteID uint32) uint64 {
 		return 0
 	}
 
-	bookInstance.mtx.RLock()
-	defer bookInstance.mtx.RUnlock()
-	if !bookInstance.synced.Load() {
-		return 0
+	// Add retry with backoff for unsynced books
+	const maxRetries = 3
+	for retryCount := 0; retryCount <= maxRetries; retryCount++ {
+		bookInstance.mtx.RLock()
+		syncedState := bookInstance.synced.Load()
+		if !syncedState {
+			// Book not synced, wait for sync or use sync channel
+			syncChan := bookInstance.syncChan
+			bookInstance.mtx.RUnlock()
+
+			if retryCount < maxRetries {
+				waitTime := time.Duration(retryCount+1) * 2 * time.Second
+				m.log.Debugf("MidGap for %s: book unsynced, attempt %d/%d, waiting %v...",
+					mexcSymbol, retryCount+1, maxRetries, waitTime)
+
+				// Request a resync if this isn't the first attempt
+				if retryCount > 0 {
+					select {
+					case m.marketSubResyncChan <- mexcSymbol:
+						m.log.Debugf("Sent resync request for %s during MidGap retry", mexcSymbol)
+					default:
+						// Already requested or channel full, continue
+					}
+				}
+
+				// Wait with timeout for sync to complete
+				timer := time.NewTimer(waitTime)
+				select {
+				case <-syncChan: // Closed when sync completes
+					timer.Stop()
+					m.log.Debugf("MidGap for %s: book synced during wait", mexcSymbol)
+					continue // Retry immediately
+				case <-timer.C:
+					// Wait expired, try again
+					continue
+				case <-m.quit: // Check global shutdown signal
+					timer.Stop()
+					return 0
+				}
+			}
+
+			// Max retries reached but still unsynced
+			m.log.Errorf("MidGap for %s: book still unsynced after %d attempts", mexcSymbol, maxRetries)
+			return 0
+		}
+
+		// Book is synced, get mid gap value
+		result := bookInstance.book.midGap()
+		bookInstance.mtx.RUnlock()
+		return result
 	}
 
-	// Use the local book's midGap method
-	return bookInstance.book.midGap() // Added return
+	// This should not be reached due to the return in the loop
+	return 0
 }
 
 // ConfirmDeposit checks the status of a deposit by querying deposit history.
@@ -3561,4 +3671,57 @@ func (m *mexc) clearTradeTrackingForMarket(baseID, quoteID uint32) {
 	// If needed, individual subscribers should manage their own unsubscribe
 
 	m.log.Infof("Cleared trade tracking for market %d/%d", baseID, quoteID)
+}
+
+// monitorOrderbookHealth periodically checks for unsynced orderbooks and attempts to resync them.
+// This helps prevent "orderbook not synced" errors from persisting too long.
+func (m *mexc) monitorOrderbookHealth(ctx context.Context) {
+	defer m.wg.Done()
+
+	const checkInterval = 30 * time.Second
+	timer := time.NewTimer(checkInterval)
+	defer timer.Stop()
+
+	m.log.Infof("Starting orderbook health monitor (Interval: %v)", checkInterval)
+	defer m.log.Infof("Stopping orderbook health monitor.")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			m.checkAndResyncOrderbooks(ctx)
+			timer.Reset(checkInterval)
+		}
+	}
+}
+
+// checkAndResyncOrderbooks checks all orderbooks and attempts to resync any that are unsynced.
+func (m *mexc) checkAndResyncOrderbooks(ctx context.Context) {
+	m.booksMtx.RLock()
+	unsyncedBooks := make([]string, 0)
+	for symbol, book := range m.books {
+		// Only check books that have active subscribers
+		if book.numSubscribers > 0 && !book.synced.Load() {
+			unsyncedBooks = append(unsyncedBooks, symbol)
+		}
+	}
+	m.booksMtx.RUnlock()
+
+	if len(unsyncedBooks) == 0 {
+		return // All books synced
+	}
+
+	m.log.Warnf("Found %d unsynced orderbooks during health check: %v", len(unsyncedBooks), unsyncedBooks)
+
+	// Try to resync each unsynced book
+	for _, symbol := range unsyncedBooks {
+		m.log.Infof("Attempting to resync unsynced orderbook: %s", symbol)
+		select {
+		case m.marketSubResyncChan <- symbol:
+			m.log.Debugf("Sent resync request for %s during health check", symbol)
+		default:
+			m.log.Warnf("Resync channel full, couldn't request resync for %s", symbol)
+		}
+	}
 }
