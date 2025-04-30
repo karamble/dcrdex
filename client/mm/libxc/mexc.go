@@ -35,11 +35,25 @@ const (
 	NoteTypeEpochReport = "epochreport"
 )
 
+// LotFees represents fees for swap, redeem, and refund operations.
+type LotFees struct {
+	Swap   uint64 `json:"swap"`
+	Redeem uint64 `json:"redeem"`
+	Refund uint64 `json:"refund"`
+}
+
+// LotFeeRange contains estimated and maximum fees.
+type LotFeeRange struct {
+	Max       *LotFees `json:"max"`
+	Estimated *LotFees `json:"estimated"`
+}
+
 // BotBalance represents a balance with available, locked, and pending components.
 type BotBalance struct {
 	Available uint64 `json:"available"`
 	Locked    uint64 `json:"locked"`
 	Pending   uint64 `json:"pending"`
+	Reserved  uint64 `json:"reserved"`
 }
 
 // TradePlacement describes a trade placement.
@@ -68,6 +82,7 @@ type OrderReport struct {
 	RequiredCexBal   uint64                 `json:"requiredCexBal"`
 	RemainingCexBal  uint64                 `json:"remainingCexBal"`
 	UsedCexBal       uint64                 `json:"usedCexBal"`
+	Fees             *LotFeeRange           `json:"fees"`
 }
 
 // EpochReport contains a report of a bot's activity during an epoch.
@@ -4320,13 +4335,70 @@ func (m *mexc) createEpochReportNote(tracker *mexcEpochTracker) {
 			EpochNum:    uint64(tracker.epochID),
 			BuysReport:  buysReport,
 			SellsReport: sellsReport,
+			// Make sure PreOrderProblems is initialized
+			PreOrderProblems: &BotProblems{},
 		},
+	}
+
+	// Validate the note structure before broadcasting
+	if err := validateEpochReportNote(note); err != nil {
+		m.log.Errorf("Invalid EpochReportNote: %v", err)
+		// Try to fix any missing fields
+		if note.Report != nil {
+			if note.Report.PreOrderProblems == nil {
+				note.Report.PreOrderProblems = &BotProblems{}
+			}
+		}
 	}
 
 	// Broadcast the note
 	if m.broadcast != nil {
 		m.broadcast(note)
 	}
+}
+
+// validateEpochReportNote checks that all required fields are present and initialized
+func validateEpochReportNote(note *EpochReportNote) error {
+	if note == nil {
+		return errors.New("note is nil")
+	}
+	if note.Report == nil {
+		return errors.New("note.Report is nil")
+	}
+
+	// Check BuysReport if present
+	if note.Report.BuysReport != nil {
+		if note.Report.BuysReport.Fees == nil {
+			return errors.New("BuysReport.Fees is nil")
+		}
+		if note.Report.BuysReport.Fees.Max == nil {
+			return errors.New("BuysReport.Fees.Max is nil")
+		}
+		if note.Report.BuysReport.Fees.Estimated == nil {
+			return errors.New("BuysReport.Fees.Estimated is nil")
+		}
+		if note.Report.BuysReport.AvailableCexBal == nil {
+			return errors.New("BuysReport.AvailableCexBal is nil")
+		}
+	}
+
+	// Check SellsReport if present
+	if note.Report.SellsReport != nil {
+		if note.Report.SellsReport.Fees == nil {
+			return errors.New("SellsReport.Fees is nil")
+		}
+		if note.Report.SellsReport.Fees.Max == nil {
+			return errors.New("SellsReport.Fees.Max is nil")
+		}
+		if note.Report.SellsReport.Fees.Estimated == nil {
+			return errors.New("SellsReport.Fees.Estimated is nil")
+		}
+		if note.Report.SellsReport.AvailableCexBal == nil {
+			return errors.New("SellsReport.AvailableCexBal is nil")
+		}
+	}
+
+	return nil
 }
 
 // createOrderReport creates a report from placements
@@ -4342,15 +4414,28 @@ func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quote
 		RequiredDEXBals:  make(map[uint32]uint64),
 		RemainingDEXBals: make(map[uint32]uint64),
 		UsedDEXBals:      make(map[uint32]uint64),
-		// Add missing CEX fields expected by the JavaScript frontend
 		AvailableCexBal: &BotBalance{
 			Available: 0,
 			Locked:    0,
 			Pending:   0,
+			Reserved:  0, // Initialize the reserved field
 		},
 		RequiredCexBal:  0,
 		RemainingCexBal: 0,
 		UsedCexBal:      0,
+		// Initialize the fees structure with zero values
+		Fees: &LotFeeRange{
+			Max: &LotFees{
+				Swap:   0,
+				Redeem: 0,
+				Refund: 0,
+			},
+			Estimated: &LotFees{
+				Swap:   0,
+				Redeem: 0,
+				Refund: 0,
+			},
+		},
 	}
 
 	// Add balance information
@@ -4361,6 +4446,8 @@ func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quote
 		report.AvailableDEXBals[id] = &BotBalance{
 			Available: avail,
 			Locked:    locked,
+			Pending:   0, // Initialize with zero
+			Reserved:  0, // Initialize with zero
 		}
 	}
 
@@ -4384,8 +4471,6 @@ func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quote
 		}
 
 		report.Placements = append(report.Placements, uiPlacement)
-
-		// Update CEX totals for this report
 		report.RequiredCexBal += p.qty
 		report.UsedCexBal += p.executed
 	}
@@ -4397,10 +4482,13 @@ func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quote
 		locked, _ := strconv.ParseUint(tracker.balanceCEX.Locked, 10, 64)
 		report.AvailableCexBal.Available = avail
 		report.AvailableCexBal.Locked = locked
+		// Initialize other fields that might be missing
+		report.AvailableCexBal.Pending = 0
+		report.AvailableCexBal.Reserved = 0
 		tracker.mtx.Unlock()
 	}
 
-	// Calculate remaining CEX balance (available - required)
+	// Calculate remaining CEX balance
 	if report.AvailableCexBal.Available >= report.RequiredCexBal {
 		report.RemainingCexBal = report.AvailableCexBal.Available - report.RequiredCexBal
 	} else {
