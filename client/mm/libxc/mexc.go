@@ -28,6 +28,80 @@ import (
 	"decred.org/dcrdex/dex/calc"
 )
 
+// --- Notification Types for EpochReportNote ---
+
+// Common type constants for notifications
+const (
+	NoteTypeEpochReport = "epochreport"
+)
+
+// BotBalance represents a balance with available, locked, and pending components.
+type BotBalance struct {
+	Available uint64 `json:"available"`
+	Locked    uint64 `json:"locked"`
+	Pending   uint64 `json:"pending"`
+}
+
+// TradePlacement describes a trade placement.
+type TradePlacement struct {
+	Rate             float64           `json:"rate"`
+	Lots             int64             `json:"lots"`
+	StandingLots     int64             `json:"standingLots"`
+	OrderedLots      int64             `json:"orderedLots"`
+	CounterTradeRate uint64            `json:"counterTradeRate"`
+	RequiredDEX      map[uint32]uint64 `json:"requiredDEX"`
+	RequiredCEX      uint64            `json:"requiredCEX"`
+	UsedDEX          map[uint32]uint64 `json:"usedDEX"`
+	UsedCEX          uint64            `json:"usedCEX"`
+	Error            *BotProblems      `json:"error"`
+}
+
+// OrderReport summarizes the results of a trading operation.
+type OrderReport struct {
+	Placements       []*TradePlacement      `json:"placements"`
+	AvailableDEXBals map[uint32]*BotBalance `json:"availableDEXBals"`
+	RequiredDEXBals  map[uint32]uint64      `json:"requiredDEXBals"`
+	UsedDEXBals      map[uint32]uint64      `json:"usedDEXBals"`
+	RemainingDEXBals map[uint32]uint64      `json:"remainingDEXBals"`
+	Error            *BotProblems           `json:"error"`
+}
+
+// EpochReport contains a report of a bot's activity during an epoch.
+type EpochReport struct {
+	PreOrderProblems *BotProblems `json:"preOrderProblems"`
+	BuysReport       *OrderReport `json:"buysReport"`
+	SellsReport      *OrderReport `json:"sellsReport"`
+	EpochID          int64        `json:"epochID"`
+}
+
+// EpochReportNote is the notification sent when an epoch completes.
+type EpochReportNote struct {
+	Type    string       `json:"type"`
+	Host    string       `json:"host"`
+	BaseID  uint32       `json:"baseID"`
+	QuoteID uint32       `json:"quoteID"`
+	Report  *EpochReport `json:"report"`
+}
+
+// BotProblems mirrors the UI's BotProblems interface for error reporting
+type BotProblems struct {
+	WalletNotSynced      map[uint32]bool `json:"walletNotSynced,omitempty"`
+	NoWalletPeers        map[uint32]bool `json:"noWalletPeers,omitempty"`
+	AccountSuspended     bool            `json:"accountSuspended,omitempty"`
+	UserLimitTooLow      bool            `json:"userLimitTooLow,omitempty"`
+	NoPriceSource        bool            `json:"noPriceSource,omitempty"`
+	OracleFiatMismatch   bool            `json:"oracleFiatMismatch,omitempty"`
+	CEXOrderbookUnsynced bool            `json:"cexOrderbookUnsynced,omitempty"`
+	CausesSelfMatch      bool            `json:"causesSelfMatch,omitempty"`
+	InsufficientFunds    bool            `json:"insufficientFunds,omitempty"`
+	OrderTooSmall        bool            `json:"orderTooSmall,omitempty"`
+	OrderTooLarge        bool            `json:"orderTooLarge,omitempty"`
+	CEXSuspended         bool            `json:"cexSuspended,omitempty"`
+	CEXTemporaryError    bool            `json:"cexTemporaryError,omitempty"`
+	RateLimit            bool            `json:"rateLimit,omitempty"`
+	UnknownError         string          `json:"unknownError,omitempty"`
+}
+
 const (
 	mexcHTTPURL = "https://api.mexc.com"
 	mexcWsURL   = "wss://wbs.mexc.com/ws"
@@ -125,10 +199,50 @@ type mexc struct {
 	activeTrades    map[string]*mexcTradeInfo // key: MEXC order ID
 	activeTradesMtx sync.RWMutex
 
+	// Epoch tracking for MM UI
+	epochTrackers    map[int64]map[string]*mexcEpochTracker // [epochID][marketID]tracker
+	epochTrackersMtx sync.RWMutex
+
 	// Shutdown signalling
 	wg             sync.WaitGroup
 	quit           chan struct{} // Closed to signal all goroutines to exit
 	disconnectOnce sync.Once     // Ensures shutdown logic runs exactly once
+}
+
+// mexcEpochTracker tracks orders and placements for a specific epoch
+type mexcEpochTracker struct {
+	mtx         sync.Mutex
+	baseID      uint32
+	quoteID     uint32
+	epochID     int64
+	buys        []*mexcTradePlacement
+	sells       []*mexcTradePlacement
+	balancesDEX map[uint32]*ExchangeBalance
+	balanceCEX  *ExchangeBalance
+	fees        *mexcFees
+}
+
+// mexcTradePlacement tracks information about a single order placement
+type mexcTradePlacement struct {
+	orderID      string
+	rate         uint64
+	qty          uint64
+	executed     uint64
+	quoteFilled  uint64
+	complete     bool
+	success      bool
+	error        string
+	problems     *BotProblems
+	sell         bool
+	lotSize      int64
+	standingLots int64
+	timestamp    time.Time
+}
+
+// mexcFees tracks fee information for an epoch
+type mexcFees struct {
+	baseFee  uint64
+	quoteFee uint64
 }
 
 // mexcOrderBook struct definition
@@ -189,6 +303,7 @@ func newMEXC(cfg *CEXConfig) (*mexc, error) {
 		books:               make(map[string]*mexcOrderBook),
 		tradeUpdaters:       make(map[int]chan *Trade),
 		activeTrades:        make(map[string]*mexcTradeInfo),
+		epochTrackers:       make(map[int64]map[string]*mexcEpochTracker),
 		reconnectChan:       make(chan struct{}, 1),
 	}
 	// Add log check right after logger assignment
@@ -1326,23 +1441,57 @@ func (m *mexc) stringToSatoshis(decimalAmount string, conversionFactor float64) 
 
 // Trade executes a trade order on MEXC.
 func (m *mexc) Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64, subscriptionID int) (*Trade, error) {
+	// Call internal trade implementation with default epochID of 0
+	return m.tradeWithEpoch(ctx, baseID, quoteID, sell, rate, qty, subscriptionID, 0)
+}
+
+// tradeWithEpoch is an internal helper that supports epoch tracking
+func (m *mexc) tradeWithEpoch(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64, subscriptionID int, epochID int64) (*Trade, error) {
 	baseSymbol := dex.BipIDSymbol(baseID)   // Correct usage
 	quoteSymbol := dex.BipIDSymbol(quoteID) // Correct usage
-	m.log.Infof("Attempting MEXC trade: %s -> %s, Sell: %v, Rate: %d, Qty: %d, SubID: %d",
-		baseSymbol, quoteSymbol, sell, rate, qty, subscriptionID)
+	m.log.Infof("Attempting MEXC trade: %s -> %s, Sell: %v, Rate: %d, Qty: %d, SubID: %d, EpochID: %d",
+		baseSymbol, quoteSymbol, sell, rate, qty, subscriptionID, epochID)
+
+	// Create a placement object for epoch tracking
+	placement := &mexcTradePlacement{
+		rate:         rate,
+		qty:          qty,
+		sell:         sell,
+		lotSize:      1, // Default to 1, caller can update if needed
+		standingLots: 1, // Default to 1, caller can update if needed
+		timestamp:    time.Now(),
+		success:      false, // Assume failure until proven otherwise
+	}
+
+	// Get or create epoch tracker
+	tracker := m.getOrCreateEpochTracker(baseID, quoteID, epochID)
 
 	mexcSymbol, err := m.mapDEXIDsToMEXCSymbol(baseID, quoteID)
 	if err != nil {
+		// Mark placement as failed
+		placement.error = err.Error()
+		placement.problems = mapMEXCErrorToBotProblems(err)
+		m.addOrderPlacement(tracker, placement)
 		return nil, fmt.Errorf("cannot map DEX IDs to MEXC symbol for trade: %w", err)
 	}
 	symInfo, err := m.getSymbolInfo(ctx, mexcSymbol)
 	if err != nil {
+		// Mark placement as failed
+		placement.error = err.Error()
+		placement.problems = mapMEXCErrorToBotProblems(err)
+		m.addOrderPlacement(tracker, placement)
 		return nil, fmt.Errorf("cannot get MEXC symbol info for trade (%s): %w", mexcSymbol, err)
 	}
 	// Use asset.UnitInfo directly, as asset.Info doesn't support tokens
 	baseUnitInfo, baseAssetErr := asset.UnitInfo(baseID)
 	quoteUnitInfo, quoteAssetErr := asset.UnitInfo(quoteID)
 	if baseAssetErr != nil || quoteAssetErr != nil {
+		// Mark placement as failed
+		placement.error = fmt.Sprintf("Failed to get asset info: %v, %v", baseAssetErr, quoteAssetErr)
+		placement.problems = &BotProblems{
+			UnknownError: placement.error,
+		}
+		m.addOrderPlacement(tracker, placement)
 		// Keep error message consistent, but include underlying errors
 		return nil, fmt.Errorf("failed to get asset info for base %d or quote %d: %w, %w", baseID, quoteID, baseAssetErr, quoteAssetErr)
 	}
@@ -1373,6 +1522,10 @@ func (m *mexc) Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rat
 	var resp mexctypes.NewOrderResponse
 	err = m.request(ctx, http.MethodPost, path, params, nil, true, &resp)
 	if err != nil {
+		// Mark placement as failed
+		placement.error = err.Error()
+		placement.problems = mapMEXCErrorToBotProblems(err)
+		m.addOrderPlacement(tracker, placement)
 		return nil, fmt.Errorf("MEXC new order request failed: %w", err)
 	}
 
@@ -1388,6 +1541,11 @@ func (m *mexc) Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rat
 		QuoteFilled: 0,     // Initially zero
 		Complete:    false, // Initially false
 	}
+
+	// Mark placement as successful and record order ID
+	placement.orderID = resp.OrderID
+	placement.success = true
+	m.addOrderPlacement(tracker, placement)
 
 	// If there's a subscription, store info for WebSocket updates
 	if subscriptionID != 0 {
@@ -1412,6 +1570,191 @@ func (m *mexc) Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rat
 	m.log.Infof("Successfully placed MEXC order %s (%s) for %s -> %s. Qty: %s, Price: %s",
 		trade.ID, clientOrderID, baseSymbol, quoteSymbol, qtyStr, priceStr)
 	return trade, nil
+}
+
+// --- Epoch Tracking Functions ---
+
+// createNewEpoch creates a new epoch tracker for a market
+func (m *mexc) createNewEpoch(baseID, quoteID uint32, epochID int64) *mexcEpochTracker {
+	mktID, err := dex.MarketName(baseID, quoteID)
+	if err != nil {
+		m.log.Errorf("Failed to create epoch tracker: %v", err)
+		return nil
+	}
+
+	m.epochTrackersMtx.Lock()
+	defer m.epochTrackersMtx.Unlock()
+
+	// Create epoch map if it doesn't exist
+	epochMap, exists := m.epochTrackers[epochID]
+	if !exists {
+		epochMap = make(map[string]*mexcEpochTracker)
+		m.epochTrackers[epochID] = epochMap
+	}
+
+	// Create the tracker
+	tracker := &mexcEpochTracker{
+		baseID:      baseID,
+		quoteID:     quoteID,
+		epochID:     epochID,
+		buys:        make([]*mexcTradePlacement, 0),
+		sells:       make([]*mexcTradePlacement, 0),
+		balancesDEX: make(map[uint32]*ExchangeBalance),
+		fees:        &mexcFees{},
+	}
+
+	// Store balances at epoch start
+	balances, err := m.Balances(context.Background())
+	if err == nil {
+		for id, bal := range balances {
+			balCopy := *bal // Copy balance to avoid reference issues
+			tracker.balancesDEX[id] = &balCopy
+		}
+	}
+
+	// Store in epoch map
+	epochMap[mktID] = tracker
+	return tracker
+}
+
+// getEpochTracker gets an epoch tracker for a market
+func (m *mexc) getEpochTracker(baseID, quoteID uint32, epochID int64) *mexcEpochTracker {
+	mktID, err := dex.MarketName(baseID, quoteID)
+	if err != nil {
+		return nil
+	}
+
+	m.epochTrackersMtx.RLock()
+	defer m.epochTrackersMtx.RUnlock()
+
+	epochMap, exists := m.epochTrackers[epochID]
+	if !exists {
+		return nil
+	}
+
+	return epochMap[mktID]
+}
+
+// getOrCreateEpochTracker gets or creates an epoch tracker
+func (m *mexc) getOrCreateEpochTracker(baseID, quoteID uint32, epochID int64) *mexcEpochTracker {
+	tracker := m.getEpochTracker(baseID, quoteID, epochID)
+	if tracker != nil {
+		return tracker
+	}
+	return m.createNewEpoch(baseID, quoteID, epochID)
+}
+
+// handleEpochChange handles a change in epoch by finalizing reports for the previous epoch
+func (m *mexc) handleEpochChange(oldEpochID, newEpochID int64) {
+	// Generate reports for the old epoch
+	m.epochTrackersMtx.RLock()
+	oldEpochMap, exists := m.epochTrackers[oldEpochID]
+	m.epochTrackersMtx.RUnlock()
+
+	if exists {
+		for _, tracker := range oldEpochMap {
+			m.createEpochReportNote(tracker)
+		}
+	}
+}
+
+// addOrderPlacement adds a placement to an epoch tracker
+func (m *mexc) addOrderPlacement(tracker *mexcEpochTracker, placement *mexcTradePlacement) {
+	if tracker == nil {
+		return
+	}
+
+	tracker.mtx.Lock()
+	defer tracker.mtx.Unlock()
+
+	if placement.sell {
+		tracker.sells = append(tracker.sells, placement)
+	} else {
+		tracker.buys = append(tracker.buys, placement)
+	}
+}
+
+// findOrderPlacement finds a placement by order ID
+func (m *mexc) findOrderPlacement(orderID string) *mexcTradePlacement {
+	m.epochTrackersMtx.RLock()
+	defer m.epochTrackersMtx.RUnlock()
+
+	// Search all epochs
+	for _, epochMap := range m.epochTrackers {
+		for _, tracker := range epochMap {
+			tracker.mtx.Lock()
+
+			// Check buys
+			for _, p := range tracker.buys {
+				if p.orderID == orderID {
+					tracker.mtx.Unlock()
+					return p
+				}
+			}
+
+			// Check sells
+			for _, p := range tracker.sells {
+				if p.orderID == orderID {
+					tracker.mtx.Unlock()
+					return p
+				}
+			}
+
+			tracker.mtx.Unlock()
+		}
+	}
+
+	return nil
+}
+
+// updateOrderPlacement updates a placement with trade data
+func (m *mexc) updateOrderPlacement(orderID string, trade *Trade) {
+	placement := m.findOrderPlacement(orderID)
+	if placement == nil {
+		return
+	}
+
+	placement.executed = trade.BaseFilled
+	placement.quoteFilled = trade.QuoteFilled
+	placement.complete = trade.Complete
+}
+
+// mapMEXCErrorToBotProblems maps MEXC error codes to BotProblems
+func mapMEXCErrorToBotProblems(err error) *BotProblems {
+	problems := &BotProblems{}
+
+	// Check for mexctypes.ErrorResponse
+	var mexcErr *mexctypes.ErrorResponse
+	if errors.As(err, &mexcErr) {
+		switch mexcErr.Code {
+		// Order-related errors
+		case -2011:
+			problems.UnknownError = "Unknown order ID"
+		case 30000, 30016:
+			problems.CEXSuspended = true
+		case 30002:
+			problems.OrderTooSmall = true
+		case 30003, 30029:
+			problems.OrderTooLarge = true
+		case 30004, 10101:
+			problems.InsufficientFunds = true
+
+		// System errors
+		case 429:
+			problems.RateLimit = true
+		case 500, 503, 504, 20002:
+			problems.CEXTemporaryError = true
+
+		default:
+			problems.UnknownError = fmt.Sprintf("MEXC error code %d: %s", mexcErr.Code, mexcErr.Msg)
+		}
+	} else if errors.Is(err, ErrUnsyncedOrderbook) {
+		problems.CEXOrderbookUnsynced = true
+	} else {
+		problems.UnknownError = err.Error()
+	}
+
+	return problems
 }
 
 // getSymbolInfo retrieves SymbolInfo from the cached exchange info.
@@ -3152,7 +3495,6 @@ func (m *mexc) handleOrderUpdate(payload json.RawMessage) {
 	if !exists {
 		m.activeTradesMtx.RUnlock()
 		// If not found by OrderID, maybe it's the clientOrderID? Unlikely for updates, but possible.
-		// Let's assume OrderID is the primary key for updates.
 		// This could happen if the update arrives after the trade was considered complete locally or before it was stored.
 		// m.log.Warnf("Received order update for untracked MEXC OrderID: %s", orderUpdate.OrderID) // Can be noisy
 		return
@@ -3167,9 +3509,6 @@ func (m *mexc) handleOrderUpdate(payload json.RawMessage) {
 
 	// Cannot determine filled amounts from WsOrderUpdateData struct definition.
 	// Fill info comes from deal messages or REST polling.
-	// Remove the placeholder baseFilled/quoteFilled assignment.
-	// baseFilled := uint64(0) // Removed
-	// quoteFilled := uint64(0) // Removed
 
 	// Determine completion status based SOLELY on the status field of this message
 	complete := false
@@ -3183,43 +3522,33 @@ func (m *mexc) handleOrderUpdate(payload json.RawMessage) {
 		complete = false // Treat unrecognized status as not complete
 	}
 
-	// If the status indicates completion, we notify and remove from tracking.
-	// We CANNOT provide accurate fill info from this message alone.
-	if complete {
-		// Fetch potentially updated fill amounts before notifying.
-		m.activeTradesMtx.Lock() // Lock for potential delete
-		finalTradeInfo, stillExists := m.activeTrades[orderUpdate.OrderID]
-		var finalBaseFilled, finalQuoteFilled uint64
-		if stillExists {
-			// Use the latest known fill amounts stored internally (updated by deals)
-			finalBaseFilled = finalTradeInfo.baseFilled
-			finalQuoteFilled = finalTradeInfo.quoteFilled
-			delete(m.activeTrades, orderUpdate.OrderID)
-			m.log.Debugf("Removed completed/canceled trade %s from active tracking (via order update).", orderUpdate.OrderID)
-		}
-		m.activeTradesMtx.Unlock()
-
-		if stillExists { // Only notify if we actually removed it
-			tradeUpdate := &Trade{
-				ID:          orderUpdate.OrderID,
-				Sell:        orderUpdate.Side == "SELL",
-				Qty:         originalQty,  // Return original requested qty
-				Rate:        originalRate, // Return original requested rate
-				BaseID:      baseID,
-				QuoteID:     quoteID,
-				BaseFilled:  finalBaseFilled,  // Use latest known fill
-				QuoteFilled: finalQuoteFilled, // Use latest known fill
-				Complete:    true,
-			}
-			m.notifySubscriber(subID, tradeUpdate)
-		}
-	} else {
-		// If not complete based on status, we don't send an update from here.
-		// Updates with fill info should come from handleDealUpdate.
-		m.log.Tracef("Non-terminal order status '%s' received for %s, no update sent from handleOrderUpdate.", orderUpdate.Status, orderUpdate.OrderID)
+	// Create Trade object that will be used for both notification and updating the placement
+	tradeUpdate := &Trade{
+		ID:          orderUpdate.OrderID,
+		Sell:        orderUpdate.Side == "SELL",
+		Qty:         originalQty,  // Return original requested qty
+		Rate:        originalRate, // Return original requested rate
+		BaseID:      baseID,
+		QuoteID:     quoteID,
+		BaseFilled:  tradeInfo.baseFilled,  // Use latest known fill from tradeInfo
+		QuoteFilled: tradeInfo.quoteFilled, // Use latest known fill from tradeInfo
+		Complete:    complete,
 	}
 
-	// -- Old notification logic removed as it lacked fill info --
+	// Update placement in epoch tracker
+	m.updateOrderPlacement(orderUpdate.OrderID, tradeUpdate)
+
+	// If the status indicates completion, we notify and remove from tracking.
+	if complete {
+		// Remove from active trades tracking
+		m.activeTradesMtx.Lock() // Lock for delete
+		delete(m.activeTrades, orderUpdate.OrderID)
+		m.log.Debugf("Removed completed/canceled trade %s from active tracking (via order update).", orderUpdate.OrderID)
+		m.activeTradesMtx.Unlock()
+
+		// Notify subscriber
+		m.notifySubscriber(subID, tradeUpdate)
+	}
 }
 
 // handleDealUpdate processes trade execution messages and updates trade state.
@@ -3314,6 +3643,9 @@ func (m *mexc) handleDealUpdate(payload json.RawMessage) {
 		// TODO: Add timestamp from deal? (dealUpdate.TransactionTime)
 		// TODO: Add fee info?
 	}
+
+	// Update placement in epoch tracker
+	m.updateOrderPlacement(dealUpdate.OrderID, tradeUpdate)
 
 	// 7. Remove from activeTrades if complete
 	if complete {
@@ -3959,4 +4291,87 @@ func (m *mexc) checkAndResubscribeMarkets() {
 
 	// Call the implementation function which contains the actual resubscription logic
 	m.resubscribeMarkets()
+}
+
+// createEpochReportNote generates a report for an epoch and broadcasts it
+func (m *mexc) createEpochReportNote(tracker *mexcEpochTracker) {
+	if tracker == nil {
+		return
+	}
+
+	tracker.mtx.Lock()
+	defer tracker.mtx.Unlock()
+
+	// Create buy and sell reports
+	buysReport := m.createOrderReport(tracker.buys, tracker.baseID, tracker.quoteID, tracker.balancesDEX)
+	sellsReport := m.createOrderReport(tracker.sells, tracker.baseID, tracker.quoteID, tracker.balancesDEX)
+
+	// Create the epoch report
+	note := &EpochReportNote{
+		Type:    NoteTypeEpochReport,
+		Host:    "MEXC",
+		BaseID:  tracker.baseID,
+		QuoteID: tracker.quoteID,
+		Report: &EpochReport{
+			EpochID:     tracker.epochID,
+			BuysReport:  buysReport,
+			SellsReport: sellsReport,
+		},
+	}
+
+	// Broadcast the note
+	if m.broadcast != nil {
+		m.broadcast(note)
+	}
+}
+
+// createOrderReport creates a report from placements
+func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quoteID uint32, balances map[uint32]*ExchangeBalance) *OrderReport {
+	if len(placements) == 0 {
+		return nil
+	}
+
+	// Create the report structure
+	report := &OrderReport{
+		Placements:       make([]*TradePlacement, 0, len(placements)),
+		AvailableDEXBals: make(map[uint32]*BotBalance),
+		RequiredDEXBals:  make(map[uint32]uint64),
+		RemainingDEXBals: make(map[uint32]uint64),
+		UsedDEXBals:      make(map[uint32]uint64),
+	}
+
+	// Add balance information
+	for id, balance := range balances {
+		avail, _ := strconv.ParseUint(balance.Available, 10, 64)
+		locked, _ := strconv.ParseUint(balance.Locked, 10, 64)
+
+		report.AvailableDEXBals[id] = &BotBalance{
+			Available: avail,
+			Locked:    locked,
+		}
+	}
+
+	// Convert placements to UI format
+	for _, p := range placements {
+		uiPlacement := &TradePlacement{
+			Rate:             float64(p.rate) / 1e8, // Convert to conventional rate
+			Lots:             p.lotSize,
+			StandingLots:     p.standingLots,
+			OrderedLots:      p.standingLots - p.lotSize,
+			CounterTradeRate: 0, // Not applicable for MEXC
+			RequiredDEX:      make(map[uint32]uint64),
+			RequiredCEX:      p.qty,
+			UsedDEX:          make(map[uint32]uint64),
+			UsedCEX:          p.executed,
+		}
+
+		// Set error if placement failed
+		if !p.success {
+			uiPlacement.Error = p.problems
+		}
+
+		report.Placements = append(report.Placements, uiPlacement)
+	}
+
+	return report
 }
