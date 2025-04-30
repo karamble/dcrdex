@@ -64,6 +64,10 @@ type OrderReport struct {
 	UsedDEXBals      map[uint32]uint64      `json:"usedDEXBals"`
 	RemainingDEXBals map[uint32]uint64      `json:"remainingDEXBals"`
 	Error            *BotProblems           `json:"error"`
+	AvailableCexBal  *BotBalance            `json:"availableCexBal"`
+	RequiredCexBal   uint64                 `json:"requiredCexBal"`
+	RemainingCexBal  uint64                 `json:"remainingCexBal"`
+	UsedCexBal       uint64                 `json:"usedCexBal"`
 }
 
 // EpochReport contains a report of a bot's activity during an epoch.
@@ -4338,6 +4342,15 @@ func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quote
 		RequiredDEXBals:  make(map[uint32]uint64),
 		RemainingDEXBals: make(map[uint32]uint64),
 		UsedDEXBals:      make(map[uint32]uint64),
+		// Add missing CEX fields expected by the JavaScript frontend
+		AvailableCexBal: &BotBalance{
+			Available: 0,
+			Locked:    0,
+			Pending:   0,
+		},
+		RequiredCexBal:  0,
+		RemainingCexBal: 0,
+		UsedCexBal:      0,
 	}
 
 	// Add balance information
@@ -4371,6 +4384,27 @@ func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quote
 		}
 
 		report.Placements = append(report.Placements, uiPlacement)
+
+		// Update CEX totals for this report
+		report.RequiredCexBal += p.qty
+		report.UsedCexBal += p.executed
+	}
+
+	// If we have tracker.balanceCEX, use it for available balance
+	if tracker := m.getEpochTracker(baseID, quoteID, 0); tracker != nil && tracker.balanceCEX != nil {
+		tracker.mtx.Lock()
+		avail, _ := strconv.ParseUint(tracker.balanceCEX.Available, 10, 64)
+		locked, _ := strconv.ParseUint(tracker.balanceCEX.Locked, 10, 64)
+		report.AvailableCexBal.Available = avail
+		report.AvailableCexBal.Locked = locked
+		tracker.mtx.Unlock()
+	}
+
+	// Calculate remaining CEX balance (available - required)
+	if report.AvailableCexBal.Available >= report.RequiredCexBal {
+		report.RemainingCexBal = report.AvailableCexBal.Available - report.RequiredCexBal
+	} else {
+		report.RemainingCexBal = 0
 	}
 
 	return report
