@@ -4340,74 +4340,69 @@ func (m *mexc) createEpochReportNote(tracker *mexcEpochTracker) {
 		},
 	}
 
-	// Validate and autocorrect the note before broadcasting
+	// Make sure all reports are properly initialized
+	// This is critical for the frontend to work
 	if err := validateEpochReportNote(note); err != nil {
-		m.log.Errorf("Invalid EpochReportNote initially: %v - attempting auto-correction", err)
-
-		// Apply validation again to perform autocorrection
-		// This handles fields that might become valid during the first validation
-		validateEpochReportNote(note)
-
-		// Perform a final validation
-		if err := validateEpochReportNote(note); err != nil {
-			m.log.Errorf("EpochReportNote still invalid after correction attempts: %v", err)
-		} else {
-			m.log.Debugf("EpochReportNote successfully corrected")
+		m.log.Errorf("Error validating EpochReportNote: %v", err)
+		// Try to auto-fix the issues
+		if note.Report != nil {
+			// Ensure both report types are present, even if empty
+			if note.Report.BuysReport == nil {
+				note.Report.BuysReport = m.createOrderReport(nil, tracker.baseID, tracker.quoteID, tracker.balancesDEX)
+			}
+			if note.Report.SellsReport == nil {
+				note.Report.SellsReport = m.createOrderReport(nil, tracker.baseID, tracker.quoteID, tracker.balancesDEX)
+			}
 		}
 	}
 
-	// Additional safety check: ensure buys/sells reports have basic structure
-	if note.Report.BuysReport == nil {
-		note.Report.BuysReport = &OrderReport{
-			Placements:       []*TradePlacement{},
-			AvailableDEXBals: make(map[uint32]*BotBalance),
-			RequiredDEXBals:  make(map[uint32]uint64),
-			RemainingDEXBals: make(map[uint32]uint64),
-			UsedDEXBals:      make(map[uint32]uint64),
-			Error:            &BotProblems{},
-			AvailableCexBal: &BotBalance{
-				Available: 0,
-				Locked:    0,
-				Pending:   0,
-				Reserved:  0,
-			},
-			RequiredCexBal:  0,
-			RemainingCexBal: 0,
-			UsedCexBal:      0,
-			Fees: &LotFeeRange{
-				Max:       &LotFees{Swap: 0, Redeem: 0, Refund: 0},
-				Estimated: &LotFees{Swap: 0, Redeem: 0, Refund: 0},
-			},
-		}
+	// Ensure pending and reserved are properly set in the AvailableCexBal
+	// This is critical for the cexDeficiencyWithPendingBox to work in the frontend
+	ensureCexBalanceFields(note)
+
+	// Perform a final validation
+	if err := validateEpochReportNote(note); err != nil {
+		m.log.Errorf("Final EpochReportNote validation failed: %v", err)
 	}
 
-	if note.Report.SellsReport == nil {
-		note.Report.SellsReport = &OrderReport{
-			Placements:       []*TradePlacement{},
-			AvailableDEXBals: make(map[uint32]*BotBalance),
-			RequiredDEXBals:  make(map[uint32]uint64),
-			RemainingDEXBals: make(map[uint32]uint64),
-			UsedDEXBals:      make(map[uint32]uint64),
-			Error:            &BotProblems{},
-			AvailableCexBal: &BotBalance{
-				Available: 0,
-				Locked:    0,
-				Pending:   0,
-				Reserved:  0,
-			},
-			RequiredCexBal:  0,
-			RemainingCexBal: 0,
-			UsedCexBal:      0,
-			Fees: &LotFeeRange{
-				Max:       &LotFees{Swap: 0, Redeem: 0, Refund: 0},
-				Estimated: &LotFees{Swap: 0, Redeem: 0, Refund: 0},
-			},
-		}
-	}
+	// Log the note structure (for debugging)
+	noteJSON, _ := json.Marshal(note)
+	m.log.Debugf("Broadcasting EpochReportNote: %s", string(noteJSON))
 
 	// Broadcast the note
 	if m.broadcast != nil {
 		m.broadcast(note)
+	}
+}
+
+// ensureCexBalanceFields makes sure all fields needed for deficiency calculation are present
+func ensureCexBalanceFields(note *EpochReportNote) {
+	if note == nil || note.Report == nil {
+		return
+	}
+
+	// Process BuysReport
+	if note.Report.BuysReport != nil && note.Report.BuysReport.AvailableCexBal != nil {
+		// Ensure pending and reserved are both set
+		// These are critical for cexDeficiencyWithPendingBox to work
+		bal := note.Report.BuysReport.AvailableCexBal
+
+		// Make sure we're explicitly setting even if zero
+		// This ensures the field exists in the JSON
+		bal.Pending = bal.Pending
+		bal.Reserved = bal.Reserved
+	}
+
+	// Process SellsReport
+	if note.Report.SellsReport != nil && note.Report.SellsReport.AvailableCexBal != nil {
+		// Ensure pending and reserved are both set
+		// These are critical for cexDeficiencyWithPendingBox to work
+		bal := note.Report.SellsReport.AvailableCexBal
+
+		// Make sure we're explicitly setting even if zero
+		// This ensures the field exists in the JSON
+		bal.Pending = bal.Pending
+		bal.Reserved = bal.Reserved
 	}
 }
 
@@ -4455,21 +4450,38 @@ func validateEpochReportNote(note *EpochReportNote) error {
 				Pending:   0,
 				Reserved:  0,
 			}
+		} else {
+			// Make sure the Reserved field exists and is initialized
+			// This is critical for form.cexDeficiencyWithPendingBox to work
+			bal := note.Report.BuysReport.AvailableCexBal
+			if bal.Reserved == 0 {
+				// We're intentionally setting this even if it's already 0
+				// to ensure the field exists in the JSON
+				bal.Reserved = 0
+			}
 		}
 
-		// Ensure all balances and values are at least initialized to zero
-		if note.Report.BuysReport.RequiredCexBal == 0 {
-			note.Report.BuysReport.RequiredCexBal = 0
+		// Ensure all required map fields exist
+		if note.Report.BuysReport.AvailableDEXBals == nil {
+			note.Report.BuysReport.AvailableDEXBals = make(map[uint32]*BotBalance)
 		}
-		if note.Report.BuysReport.RemainingCexBal == 0 {
-			note.Report.BuysReport.RemainingCexBal = 0
+		if note.Report.BuysReport.RequiredDEXBals == nil {
+			note.Report.BuysReport.RequiredDEXBals = make(map[uint32]uint64)
 		}
-		if note.Report.BuysReport.UsedCexBal == 0 {
-			note.Report.BuysReport.UsedCexBal = 0
+		if note.Report.BuysReport.RemainingDEXBals == nil {
+			note.Report.BuysReport.RemainingDEXBals = make(map[uint32]uint64)
+		}
+		if note.Report.BuysReport.UsedDEXBals == nil {
+			note.Report.BuysReport.UsedDEXBals = make(map[uint32]uint64)
+		}
+
+		// Ensure placememts array exists
+		if note.Report.BuysReport.Placements == nil {
+			note.Report.BuysReport.Placements = make([]*TradePlacement, 0)
 		}
 	}
 
-	// Check SellsReport if present
+	// Check SellsReport if present - same validation as BuysReport
 	if note.Report.SellsReport != nil {
 		// Ensure Error field is initialized
 		if note.Report.SellsReport.Error == nil {
@@ -4499,17 +4511,34 @@ func validateEpochReportNote(note *EpochReportNote) error {
 				Pending:   0,
 				Reserved:  0,
 			}
+		} else {
+			// Make sure the Reserved field exists and is initialized
+			// This is critical for form.cexDeficiencyWithPendingBox to work
+			bal := note.Report.SellsReport.AvailableCexBal
+			if bal.Reserved == 0 {
+				// We're intentionally setting this even if it's already 0
+				// to ensure the field exists in the JSON
+				bal.Reserved = 0
+			}
 		}
 
-		// Ensure all balances and values are at least initialized to zero
-		if note.Report.SellsReport.RequiredCexBal == 0 {
-			note.Report.SellsReport.RequiredCexBal = 0
+		// Ensure all required map fields exist
+		if note.Report.SellsReport.AvailableDEXBals == nil {
+			note.Report.SellsReport.AvailableDEXBals = make(map[uint32]*BotBalance)
 		}
-		if note.Report.SellsReport.RemainingCexBal == 0 {
-			note.Report.SellsReport.RemainingCexBal = 0
+		if note.Report.SellsReport.RequiredDEXBals == nil {
+			note.Report.SellsReport.RequiredDEXBals = make(map[uint32]uint64)
 		}
-		if note.Report.SellsReport.UsedCexBal == 0 {
-			note.Report.SellsReport.UsedCexBal = 0
+		if note.Report.SellsReport.RemainingDEXBals == nil {
+			note.Report.SellsReport.RemainingDEXBals = make(map[uint32]uint64)
+		}
+		if note.Report.SellsReport.UsedDEXBals == nil {
+			note.Report.SellsReport.UsedDEXBals = make(map[uint32]uint64)
+		}
+
+		// Ensure placememts array exists
+		if note.Report.SellsReport.Placements == nil {
+			note.Report.SellsReport.Placements = make([]*TradePlacement, 0)
 		}
 	}
 
@@ -4519,9 +4548,9 @@ func validateEpochReportNote(note *EpochReportNote) error {
 // createOrderReport creates a report from placements
 func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quoteID uint32, balances map[uint32]*ExchangeBalance) *OrderReport {
 	if len(placements) == 0 {
-		// Return a minimal but fully initialized report to prevent nil references in the UI
+		// Return a minimal but fully initialized report to prevent nil references
 		return &OrderReport{
-			Placements:       []*TradePlacement{},
+			Placements:       make([]*TradePlacement, 0),
 			AvailableDEXBals: make(map[uint32]*BotBalance),
 			RequiredDEXBals:  make(map[uint32]uint64),
 			RemainingDEXBals: make(map[uint32]uint64),
@@ -4609,6 +4638,7 @@ func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quote
 			RequiredCEX:      p.qty,
 			UsedDEX:          make(map[uint32]uint64),
 			UsedCEX:          p.executed,
+			Error:            nil, // Initialize to nil, set only if there's an error
 		}
 
 		// Set error if placement failed
@@ -4628,9 +4658,6 @@ func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quote
 		locked, _ := strconv.ParseUint(tracker.balanceCEX.Locked, 10, 64)
 		report.AvailableCexBal.Available = avail
 		report.AvailableCexBal.Locked = locked
-		// Initialize other fields that might be missing
-		report.AvailableCexBal.Pending = 0
-		report.AvailableCexBal.Reserved = 0
 		tracker.mtx.Unlock()
 	}
 
