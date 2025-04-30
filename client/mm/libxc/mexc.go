@@ -53,7 +53,7 @@ type BotBalance struct {
 	Available uint64 `json:"available"`
 	Locked    uint64 `json:"locked"`
 	Pending   uint64 `json:"pending"`
-	Reserved  uint64 `json:"reserved"`
+	Reserved  uint64 `json:"reserved"` // Required for cexDeficiencyWithPendingBox to work
 }
 
 // TradePlacement describes a trade placement.
@@ -4340,69 +4340,68 @@ func (m *mexc) createEpochReportNote(tracker *mexcEpochTracker) {
 		},
 	}
 
-	// Validate the note structure before broadcasting
+	// Validate and autocorrect the note before broadcasting
 	if err := validateEpochReportNote(note); err != nil {
-		m.log.Errorf("Invalid EpochReportNote: %v, attempting auto-fix", err)
-		// The validation function already attempts to fix issues, but we'll run it again
-		// to handle any fixes that might depend on each other
+		m.log.Errorf("Invalid EpochReportNote initially: %v - attempting auto-correction", err)
+
+		// Apply validation again to perform autocorrection
+		// This handles fields that might become valid during the first validation
 		validateEpochReportNote(note)
 
-		// Perform a final validation check
+		// Perform a final validation
 		if err := validateEpochReportNote(note); err != nil {
-			m.log.Errorf("Auto-fix failed, EpochReportNote still invalid: %v", err)
+			m.log.Errorf("EpochReportNote still invalid after correction attempts: %v", err)
 		} else {
-			m.log.Debugf("Auto-fix successful, EpochReportNote now valid")
+			m.log.Debugf("EpochReportNote successfully corrected")
 		}
 	}
 
-	// Additional safety checks before broadcasting
-	if note.Report != nil {
-		// Ensure BuysReport is fully initialized
-		if buysReport != nil && note.Report.BuysReport != nil {
-			// Check Error field
-			if note.Report.BuysReport.Error == nil {
-				note.Report.BuysReport.Error = &BotProblems{}
-			}
-			// Check Fees field
-			if note.Report.BuysReport.Fees == nil {
-				note.Report.BuysReport.Fees = &LotFeeRange{
-					Max:       &LotFees{Swap: 0, Redeem: 0, Refund: 0},
-					Estimated: &LotFees{Swap: 0, Redeem: 0, Refund: 0},
-				}
-			}
-			// Check AvailableCexBal field
-			if note.Report.BuysReport.AvailableCexBal == nil {
-				note.Report.BuysReport.AvailableCexBal = &BotBalance{
-					Available: 0,
-					Locked:    0,
-					Pending:   0,
-					Reserved:  0,
-				}
-			}
+	// Additional safety check: ensure buys/sells reports have basic structure
+	if note.Report.BuysReport == nil {
+		note.Report.BuysReport = &OrderReport{
+			Placements:       []*TradePlacement{},
+			AvailableDEXBals: make(map[uint32]*BotBalance),
+			RequiredDEXBals:  make(map[uint32]uint64),
+			RemainingDEXBals: make(map[uint32]uint64),
+			UsedDEXBals:      make(map[uint32]uint64),
+			Error:            &BotProblems{},
+			AvailableCexBal: &BotBalance{
+				Available: 0,
+				Locked:    0,
+				Pending:   0,
+				Reserved:  0,
+			},
+			RequiredCexBal:  0,
+			RemainingCexBal: 0,
+			UsedCexBal:      0,
+			Fees: &LotFeeRange{
+				Max:       &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+				Estimated: &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+			},
 		}
+	}
 
-		// Ensure SellsReport is fully initialized
-		if sellsReport != nil && note.Report.SellsReport != nil {
-			// Check Error field
-			if note.Report.SellsReport.Error == nil {
-				note.Report.SellsReport.Error = &BotProblems{}
-			}
-			// Check Fees field
-			if note.Report.SellsReport.Fees == nil {
-				note.Report.SellsReport.Fees = &LotFeeRange{
-					Max:       &LotFees{Swap: 0, Redeem: 0, Refund: 0},
-					Estimated: &LotFees{Swap: 0, Redeem: 0, Refund: 0},
-				}
-			}
-			// Check AvailableCexBal field
-			if note.Report.SellsReport.AvailableCexBal == nil {
-				note.Report.SellsReport.AvailableCexBal = &BotBalance{
-					Available: 0,
-					Locked:    0,
-					Pending:   0,
-					Reserved:  0,
-				}
-			}
+	if note.Report.SellsReport == nil {
+		note.Report.SellsReport = &OrderReport{
+			Placements:       []*TradePlacement{},
+			AvailableDEXBals: make(map[uint32]*BotBalance),
+			RequiredDEXBals:  make(map[uint32]uint64),
+			RemainingDEXBals: make(map[uint32]uint64),
+			UsedDEXBals:      make(map[uint32]uint64),
+			Error:            &BotProblems{},
+			AvailableCexBal: &BotBalance{
+				Available: 0,
+				Locked:    0,
+				Pending:   0,
+				Reserved:  0,
+			},
+			RequiredCexBal:  0,
+			RemainingCexBal: 0,
+			UsedCexBal:      0,
+			Fees: &LotFeeRange{
+				Max:       &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+				Estimated: &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+			},
 		}
 	}
 
@@ -4428,41 +4427,89 @@ func validateEpochReportNote(note *EpochReportNote) error {
 
 	// Check BuysReport if present
 	if note.Report.BuysReport != nil {
-		if note.Report.BuysReport.Fees == nil {
-			return errors.New("BuysReport.Fees is nil")
-		}
-		if note.Report.BuysReport.Fees.Max == nil {
-			return errors.New("BuysReport.Fees.Max is nil")
-		}
-		if note.Report.BuysReport.Fees.Estimated == nil {
-			return errors.New("BuysReport.Fees.Estimated is nil")
-		}
-		if note.Report.BuysReport.AvailableCexBal == nil {
-			return errors.New("BuysReport.AvailableCexBal is nil")
-		}
 		// Ensure Error field is initialized
 		if note.Report.BuysReport.Error == nil {
 			note.Report.BuysReport.Error = &BotProblems{}
+		}
+
+		// Ensure Fees field is initialized with all nested objects
+		if note.Report.BuysReport.Fees == nil {
+			note.Report.BuysReport.Fees = &LotFeeRange{
+				Max:       &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+				Estimated: &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+			}
+		} else {
+			if note.Report.BuysReport.Fees.Max == nil {
+				note.Report.BuysReport.Fees.Max = &LotFees{Swap: 0, Redeem: 0, Refund: 0}
+			}
+			if note.Report.BuysReport.Fees.Estimated == nil {
+				note.Report.BuysReport.Fees.Estimated = &LotFees{Swap: 0, Redeem: 0, Refund: 0}
+			}
+		}
+
+		// Ensure AvailableCexBal is initialized with all fields
+		if note.Report.BuysReport.AvailableCexBal == nil {
+			note.Report.BuysReport.AvailableCexBal = &BotBalance{
+				Available: 0,
+				Locked:    0,
+				Pending:   0,
+				Reserved:  0,
+			}
+		}
+
+		// Ensure all balances and values are at least initialized to zero
+		if note.Report.BuysReport.RequiredCexBal == 0 {
+			note.Report.BuysReport.RequiredCexBal = 0
+		}
+		if note.Report.BuysReport.RemainingCexBal == 0 {
+			note.Report.BuysReport.RemainingCexBal = 0
+		}
+		if note.Report.BuysReport.UsedCexBal == 0 {
+			note.Report.BuysReport.UsedCexBal = 0
 		}
 	}
 
 	// Check SellsReport if present
 	if note.Report.SellsReport != nil {
-		if note.Report.SellsReport.Fees == nil {
-			return errors.New("SellsReport.Fees is nil")
-		}
-		if note.Report.SellsReport.Fees.Max == nil {
-			return errors.New("SellsReport.Fees.Max is nil")
-		}
-		if note.Report.SellsReport.Fees.Estimated == nil {
-			return errors.New("SellsReport.Fees.Estimated is nil")
-		}
-		if note.Report.SellsReport.AvailableCexBal == nil {
-			return errors.New("SellsReport.AvailableCexBal is nil")
-		}
 		// Ensure Error field is initialized
 		if note.Report.SellsReport.Error == nil {
 			note.Report.SellsReport.Error = &BotProblems{}
+		}
+
+		// Ensure Fees field is initialized with all nested objects
+		if note.Report.SellsReport.Fees == nil {
+			note.Report.SellsReport.Fees = &LotFeeRange{
+				Max:       &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+				Estimated: &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+			}
+		} else {
+			if note.Report.SellsReport.Fees.Max == nil {
+				note.Report.SellsReport.Fees.Max = &LotFees{Swap: 0, Redeem: 0, Refund: 0}
+			}
+			if note.Report.SellsReport.Fees.Estimated == nil {
+				note.Report.SellsReport.Fees.Estimated = &LotFees{Swap: 0, Redeem: 0, Refund: 0}
+			}
+		}
+
+		// Ensure AvailableCexBal is initialized with all fields
+		if note.Report.SellsReport.AvailableCexBal == nil {
+			note.Report.SellsReport.AvailableCexBal = &BotBalance{
+				Available: 0,
+				Locked:    0,
+				Pending:   0,
+				Reserved:  0,
+			}
+		}
+
+		// Ensure all balances and values are at least initialized to zero
+		if note.Report.SellsReport.RequiredCexBal == 0 {
+			note.Report.SellsReport.RequiredCexBal = 0
+		}
+		if note.Report.SellsReport.RemainingCexBal == 0 {
+			note.Report.SellsReport.RemainingCexBal = 0
+		}
+		if note.Report.SellsReport.UsedCexBal == 0 {
+			note.Report.SellsReport.UsedCexBal = 0
 		}
 	}
 
@@ -4472,7 +4519,37 @@ func validateEpochReportNote(note *EpochReportNote) error {
 // createOrderReport creates a report from placements
 func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quoteID uint32, balances map[uint32]*ExchangeBalance) *OrderReport {
 	if len(placements) == 0 {
-		return nil
+		// Return a minimal but fully initialized report to prevent nil references in the UI
+		return &OrderReport{
+			Placements:       []*TradePlacement{},
+			AvailableDEXBals: make(map[uint32]*BotBalance),
+			RequiredDEXBals:  make(map[uint32]uint64),
+			RemainingDEXBals: make(map[uint32]uint64),
+			UsedDEXBals:      make(map[uint32]uint64),
+			Error:            &BotProblems{}, // Always initialize Error field
+			AvailableCexBal: &BotBalance{
+				Available: 0,
+				Locked:    0,
+				Pending:   0,
+				Reserved:  0, // Initialize the reserved field
+			},
+			RequiredCexBal:  0,
+			RemainingCexBal: 0,
+			UsedCexBal:      0,
+			// Initialize the fees structure with zero values
+			Fees: &LotFeeRange{
+				Max: &LotFees{
+					Swap:   0,
+					Redeem: 0,
+					Refund: 0,
+				},
+				Estimated: &LotFees{
+					Swap:   0,
+					Redeem: 0,
+					Refund: 0,
+				},
+			},
+		}
 	}
 
 	// Create the report structure
