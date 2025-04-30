@@ -71,7 +71,7 @@ type EpochReport struct {
 	PreOrderProblems *BotProblems `json:"preOrderProblems"`
 	BuysReport       *OrderReport `json:"buysReport"`
 	SellsReport      *OrderReport `json:"sellsReport"`
-	EpochID          int64        `json:"epochID"`
+	EpochNum         uint64       `json:"epochNum"`
 }
 
 // EpochReportNote is the notification sent when an epoch completes.
@@ -4308,12 +4308,12 @@ func (m *mexc) createEpochReportNote(tracker *mexcEpochTracker) {
 
 	// Create the epoch report
 	note := &EpochReportNote{
-		Type:    NoteTypeEpochReport,
+		Type:    "epochreport",
 		Host:    "MEXC",
 		BaseID:  tracker.baseID,
 		QuoteID: tracker.quoteID,
 		Report: &EpochReport{
-			EpochID:     tracker.epochID,
+			EpochNum:    uint64(tracker.epochID),
 			BuysReport:  buysReport,
 			SellsReport: sellsReport,
 		},
