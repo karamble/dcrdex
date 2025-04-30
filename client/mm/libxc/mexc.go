@@ -4342,11 +4342,66 @@ func (m *mexc) createEpochReportNote(tracker *mexcEpochTracker) {
 
 	// Validate the note structure before broadcasting
 	if err := validateEpochReportNote(note); err != nil {
-		m.log.Errorf("Invalid EpochReportNote: %v", err)
-		// Try to fix any missing fields
-		if note.Report != nil {
-			if note.Report.PreOrderProblems == nil {
-				note.Report.PreOrderProblems = &BotProblems{}
+		m.log.Errorf("Invalid EpochReportNote: %v, attempting auto-fix", err)
+		// The validation function already attempts to fix issues, but we'll run it again
+		// to handle any fixes that might depend on each other
+		validateEpochReportNote(note)
+
+		// Perform a final validation check
+		if err := validateEpochReportNote(note); err != nil {
+			m.log.Errorf("Auto-fix failed, EpochReportNote still invalid: %v", err)
+		} else {
+			m.log.Debugf("Auto-fix successful, EpochReportNote now valid")
+		}
+	}
+
+	// Additional safety checks before broadcasting
+	if note.Report != nil {
+		// Ensure BuysReport is fully initialized
+		if buysReport != nil && note.Report.BuysReport != nil {
+			// Check Error field
+			if note.Report.BuysReport.Error == nil {
+				note.Report.BuysReport.Error = &BotProblems{}
+			}
+			// Check Fees field
+			if note.Report.BuysReport.Fees == nil {
+				note.Report.BuysReport.Fees = &LotFeeRange{
+					Max:       &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+					Estimated: &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+				}
+			}
+			// Check AvailableCexBal field
+			if note.Report.BuysReport.AvailableCexBal == nil {
+				note.Report.BuysReport.AvailableCexBal = &BotBalance{
+					Available: 0,
+					Locked:    0,
+					Pending:   0,
+					Reserved:  0,
+				}
+			}
+		}
+
+		// Ensure SellsReport is fully initialized
+		if sellsReport != nil && note.Report.SellsReport != nil {
+			// Check Error field
+			if note.Report.SellsReport.Error == nil {
+				note.Report.SellsReport.Error = &BotProblems{}
+			}
+			// Check Fees field
+			if note.Report.SellsReport.Fees == nil {
+				note.Report.SellsReport.Fees = &LotFeeRange{
+					Max:       &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+					Estimated: &LotFees{Swap: 0, Redeem: 0, Refund: 0},
+				}
+			}
+			// Check AvailableCexBal field
+			if note.Report.SellsReport.AvailableCexBal == nil {
+				note.Report.SellsReport.AvailableCexBal = &BotBalance{
+					Available: 0,
+					Locked:    0,
+					Pending:   0,
+					Reserved:  0,
+				}
 			}
 		}
 	}
@@ -4366,6 +4421,11 @@ func validateEpochReportNote(note *EpochReportNote) error {
 		return errors.New("note.Report is nil")
 	}
 
+	// Always ensure PreOrderProblems is initialized
+	if note.Report.PreOrderProblems == nil {
+		note.Report.PreOrderProblems = &BotProblems{}
+	}
+
 	// Check BuysReport if present
 	if note.Report.BuysReport != nil {
 		if note.Report.BuysReport.Fees == nil {
@@ -4379,6 +4439,10 @@ func validateEpochReportNote(note *EpochReportNote) error {
 		}
 		if note.Report.BuysReport.AvailableCexBal == nil {
 			return errors.New("BuysReport.AvailableCexBal is nil")
+		}
+		// Ensure Error field is initialized
+		if note.Report.BuysReport.Error == nil {
+			note.Report.BuysReport.Error = &BotProblems{}
 		}
 	}
 
@@ -4395,6 +4459,10 @@ func validateEpochReportNote(note *EpochReportNote) error {
 		}
 		if note.Report.SellsReport.AvailableCexBal == nil {
 			return errors.New("SellsReport.AvailableCexBal is nil")
+		}
+		// Ensure Error field is initialized
+		if note.Report.SellsReport.Error == nil {
+			note.Report.SellsReport.Error = &BotProblems{}
 		}
 	}
 
@@ -4414,6 +4482,7 @@ func (m *mexc) createOrderReport(placements []*mexcTradePlacement, baseID, quote
 		RequiredDEXBals:  make(map[uint32]uint64),
 		RemainingDEXBals: make(map[uint32]uint64),
 		UsedDEXBals:      make(map[uint32]uint64),
+		Error:            &BotProblems{}, // Always initialize Error field
 		AvailableCexBal: &BotBalance{
 			Available: 0,
 			Locked:    0,
