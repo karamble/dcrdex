@@ -368,8 +368,14 @@ export default class MarketMakerSettingsPage extends BasePage {
     })
     Doc.bind(page.intermediateAssetSelect, 'change', () => {
       if (!page.intermediateAssetSelect.value) return
-      this.updatedConfig.intermediateAsset = Number(page.intermediateAssetSelect.value)
-      console.log('intermediateAsset', this.updatedConfig.intermediateAsset)
+      const selectedIntermediate = Number(page.intermediateAssetSelect.value)
+      this.updatedConfig.intermediateAsset = selectedIntermediate
+      // Regenerate multiHop config with the selected intermediate asset
+      const { cexBaseID, cexQuoteID } = this.updatedConfig
+      this.updatedConfig.multiHop = this.defaultMultiHopCfg(
+        this.specs.cexName, cexBaseID, cexQuoteID, selectedIntermediate
+      )
+      console.log('intermediateAsset', selectedIntermediate, 'multiHop updated:', this.updatedConfig.multiHop)
     })
 
     // Buy/Sell placements
@@ -673,7 +679,7 @@ export default class MarketMakerSettingsPage extends BasePage {
     updateAllocations(dexAssetIDs, this.updatedConfig.uiConfig.allocation.dex)
 
     if (this.specs.cexName) {
-      const cexAssetIDs = [this.updatedConfig.cexBaseID, this.updatedConfig.cexQuoteID]
+      const cexAssetIDs = this.requiredCexAssets(this.updatedConfig.cexBaseID, this.updatedConfig.cexQuoteID)
       updateAllocations(cexAssetIDs, this.updatedConfig.uiConfig.allocation.cex)
     }
   }
@@ -818,7 +824,7 @@ export default class MarketMakerSettingsPage extends BasePage {
     }
 
     if (this.specs.cexName) {
-      const cexAssetIDs = [cexBaseID, cexQuoteID]
+      const cexAssetIDs = this.requiredCexAssets(cexBaseID, cexQuoteID)
       for (const assetID of cexAssetIDs) {
         const [cexMin, cexMax] = this.validManualBalanceRange(assetID, 'cex', false)
         uiConfig.allocation.cex[assetID] = Math.min(Math.max(uiConfig.allocation.cex[assetID], cexMin), cexMax)
@@ -941,9 +947,19 @@ export default class MarketMakerSettingsPage extends BasePage {
       }
     }
 
-    // If either of the markets are no longer available, use the default.
+    // If either of the markets are no longer available, use the default with the saved intermediate asset.
     if (!foundSavedBaseMkt || !foundSavedQuoteMkt) {
-      const res = this.findMultiHopMarkets(savedBotCfg.cexName, defaultCEXBaseID, defaultCEXQuoteID, this.intermediateAssets[0])
+      // Extract the intermediate asset from the saved multiHop config
+      // The intermediate asset appears in both baseAssetMarket and quoteAssetMarket
+      const savedIntermediate = savedMultiHopCfg.baseAssetMarket.find(id =>
+        savedMultiHopCfg.quoteAssetMarket.includes(id)
+      )
+      // Use saved intermediate asset if it's still available, otherwise use first available
+      const intermediateToUse = savedIntermediate && this.intermediateAssets.includes(savedIntermediate)
+        ? savedIntermediate
+        : this.intermediateAssets[0]
+
+      const res = this.findMultiHopMarkets(savedBotCfg.cexName, defaultCEXBaseID, defaultCEXQuoteID, intermediateToUse)
       if (!res) return undefined
       return {
         baseAssetMarket: res[0],
@@ -972,7 +988,38 @@ export default class MarketMakerSettingsPage extends BasePage {
     oldCfg.baseOptions = savedBotCfg.baseWalletOptions || {}
     oldCfg.quoteOptions = savedBotCfg.quoteWalletOptions || {}
     oldCfg.cexBaseID = savedBotCfg.cexBaseID
-    oldCfg.cexQuoteID = savedBotCfg.cexQuoteID
+
+    // Handle missing cexQuoteID (Go omits it when 0 due to omitempty tag)
+    if (savedBotCfg.cexQuoteID === undefined && savedBotCfg.arbMarketMakingConfig?.multiHop) {
+      // Extract cexQuoteID from multiHop config
+      const multiHop = savedBotCfg.arbMarketMakingConfig.multiHop
+      // Find the intermediate asset (appears in both markets)
+      const intermediateID = multiHop.baseAssetMarket[0] === savedBotCfg.cexBaseID
+        ? multiHop.baseAssetMarket[1]
+        : multiHop.baseAssetMarket[0]
+      // cexQuoteID is the non-intermediate asset in quoteAssetMarket
+      oldCfg.cexQuoteID = multiHop.quoteAssetMarket[0] === intermediateID
+        ? multiHop.quoteAssetMarket[1]
+        : multiHop.quoteAssetMarket[0]
+    } else {
+      oldCfg.cexQuoteID = savedBotCfg.cexQuoteID
+    }
+
+    // Preserve multiHop config if it exists in saved config, otherwise keep the default
+    if (savedBotCfg.arbMarketMakingConfig?.multiHop) {
+      const savedMultiHop = savedBotCfg.arbMarketMakingConfig.multiHop
+      oldCfg.multiHop = savedMultiHop
+      // Extract the intermediate asset from the multiHop config for the dropdown selection
+      // The intermediate asset appears in both baseAssetMarket and quoteAssetMarket
+      const intermediateAsset = savedMultiHop.baseAssetMarket.find(id =>
+        savedMultiHop.quoteAssetMarket.includes(id)
+      )
+      if (intermediateAsset !== undefined) {
+        oldCfg.intermediateAsset = intermediateAsset
+      }
+    }
+    // If saved config doesn't have multiHop but oldCfg does, keep oldCfg's (the default we set)
+    // This handles the case where we're editing an old bot that predates multi-hop
     if (savedBotCfg.uiConfig) oldCfg.uiConfig = savedBotCfg.uiConfig
     if (this.runningBot && !savedBotCfg.uiConfig.usingQuickBalance) {
       // If the bot is running and we are allocating manually, initialize
@@ -1047,7 +1094,6 @@ export default class MarketMakerSettingsPage extends BasePage {
     // Determine all default bridging and multi-hop related values
     let cexBaseID = baseID
     let cexQuoteID = quoteID
-    let intermediateAssets: number[] | undefined
     let baseBridgeName = ''
     let quoteBridgeName = ''
     if (cexName) {
@@ -1084,6 +1130,18 @@ export default class MarketMakerSettingsPage extends BasePage {
     }
 
     const { minBaseWithdraw, minQuoteWithdraw } = this.minWithdrawals(cexBaseID, cexQuoteID, cexName)
+
+    // Validate intermediate asset wallet exists for multi-hop
+    if (this.intermediateAssets && this.intermediateAssets.length > 0) {
+      const intermediateAsset = this.intermediateAssets[0]
+      if (!app().assets[intermediateAsset]) {
+        console.error(`Multi-hop requires asset ${intermediateAsset} wallet to be configured`)
+        Doc.show(page.missingFiatRates)
+        page.missingFiatRates.textContent = `Multi-hop trading requires an intermediate asset wallet (asset ID: ${intermediateAsset}). Please configure one first.`
+        return
+      }
+    }
+
     const oldCfg = this.originalConfig = Object.assign({}, defaultMarketMakingConfig, {
       baseOptions: this.defaultWalletOptions(baseID),
       quoteOptions: this.defaultWalletOptions(quoteID),
@@ -1093,7 +1151,7 @@ export default class MarketMakerSettingsPage extends BasePage {
       cexQuoteID: cexQuoteID,
       baseBridgeName: baseBridgeName,
       quoteBridgeName: quoteBridgeName,
-      multiHop: this.defaultMultiHopCfg(cexName, cexBaseID, cexQuoteID, intermediateAssets ? intermediateAssets[0] : undefined),
+      multiHop: this.defaultMultiHopCfg(cexName, cexBaseID, cexQuoteID, this.intermediateAssets ? this.intermediateAssets[0] : undefined),
       uiConfig: defaultUIConfig(minBaseWithdraw, minQuoteWithdraw, botType)
     }) as ConfigState
 
@@ -1111,9 +1169,19 @@ export default class MarketMakerSettingsPage extends BasePage {
     this.updateManualBalanceEntries()
 
     // Setup the multi-hop market selection UI
-    if (intermediateAssets !== undefined && intermediateAssets.length > 0) { // MultiHopArbMarket[]
+    if (this.intermediateAssets !== undefined && this.intermediateAssets.length > 0) { // MultiHopArbMarket[]
+      // Sort intermediate assets to prioritize the saved one (put it first)
+      const sortedIntermediateAssets = [...this.intermediateAssets]
+      if (oldCfg.intermediateAsset !== undefined) {
+        sortedIntermediateAssets.sort((a, b) => {
+          if (a === oldCfg.intermediateAsset) return -1
+          if (b === oldCfg.intermediateAsset) return 1
+          return 0
+        })
+      }
+
       Doc.empty(page.intermediateAssetSelect)
-      for (const intermediateAsset of intermediateAssets) {
+      for (const intermediateAsset of sortedIntermediateAssets) {
         const intermediateAssetSymbol = app().assets[intermediateAsset].symbol.toUpperCase()
         const opt = document.createElement('option')
         opt.value = String(intermediateAsset)
@@ -1121,11 +1189,11 @@ export default class MarketMakerSettingsPage extends BasePage {
         if (oldCfg.intermediateAsset === intermediateAsset) opt.selected = true
         page.intermediateAssetSelect.appendChild(opt)
       }
-      Doc.show(page.bridgeAssetBox)
+      Doc.show(page.intermediateAssetBox)
     }
 
     // Show/hide multi-hop completion section based on whether multi-hop is required
-    const requiresMultiHop = intermediateAssets !== undefined && intermediateAssets.length > 0
+    const requiresMultiHop = this.intermediateAssets !== undefined && this.intermediateAssets.length > 0
     Doc.setVis(requiresMultiHop, page.multiHopCompletionBox)
 
     Doc.setVis(this.runningBot, page.updateRunningButton)
@@ -1232,6 +1300,32 @@ export default class MarketMakerSettingsPage extends BasePage {
     return assetIDs
   }
 
+  // getIntermediateAssetID extracts the intermediate asset ID from a multi-hop config.
+  // Returns undefined if not using multi-hop or if intermediate asset cannot be determined.
+  getIntermediateAssetID (): number | undefined {
+    const multiHopCfg = this.updatedConfig.multiHop
+    if (!multiHopCfg) return undefined
+
+    const { baseID } = this.marketStuff()
+    // The intermediate asset is the non-base asset in the baseAssetMarket pair
+    const intermediateAssetID = multiHopCfg.baseAssetMarket[0]
+    if (intermediateAssetID === baseID) {
+      return multiHopCfg.baseAssetMarket[1]
+    }
+    return intermediateAssetID
+  }
+
+  // requiredCexAssets returns all CEX assets required for the bot, including
+  // intermediate assets for multi-hop trading.
+  requiredCexAssets (cexBaseID: number, cexQuoteID: number): number[] {
+    const assetIDs = [cexBaseID, cexQuoteID]
+    const intermediateAsset = this.getIntermediateAssetID()
+    if (intermediateAsset !== undefined && !assetIDs.includes(intermediateAsset)) {
+      assetIDs.push(intermediateAsset)
+    }
+    return assetIDs
+  }
+
   setupMinTransferInputs () {
     const { bui, qui } = this.walletStuff()
     const { cexName } = this.specs
@@ -1298,7 +1392,13 @@ export default class MarketMakerSettingsPage extends BasePage {
       this.manualBalanceInputs.dex[dexAssetIDs[i]] = [input, slider]
     }
 
-    for (const assetID of [cexBaseID, cexQuoteID]) {
+    const cexAssetIDs = this.requiredCexAssets(cexBaseID, cexQuoteID)
+    for (const assetID of cexAssetIDs) {
+      const asset = app().assets[assetID]
+      if (!asset) {
+        console.warn(`Asset ${assetID} not configured, skipping manual balance entry`)
+        continue
+      }
       const [entry, input, slider] = createEntrySection(assetID, 'cex')
       cexSection.appendChild(entry)
       this.manualBalanceInputs.cex[assetID] = [input, slider]
@@ -1331,12 +1431,26 @@ export default class MarketMakerSettingsPage extends BasePage {
       }
     }
 
-    // Add columns for all assets. DEX row requires all asset,
-    for (let i = 0; i < dexAssetIDs.length; i++) {
-      const assetID = dexAssetIDs[i]
+    // Build list of all unique assets for column headers
+    const cexAssetIDs = this.specs.cexName ? this.requiredCexAssets(cexBaseID, cexQuoteID) : []
+    const allAssetIDs: number[] = [...dexAssetIDs]
+    for (const cexAssetID of cexAssetIDs) {
+      if (!allAssetIDs.includes(cexAssetID)) {
+        allAssetIDs.push(cexAssetID)
+      }
+    }
+
+    // Add columns for all unique assets
+    for (let i = 0; i < allAssetIDs.length; i++) {
+      const assetID = allAssetIDs[i]
       const asset = app().assets[assetID]
 
-      // Add header
+      if (!asset) {
+        console.warn(`Asset ${assetID} not found, skipping column`)
+        continue
+      }
+
+      // Add header for this asset
       const th = document.createElement('th')
       th.className = 'text-center'
       const img = document.createElement('img')
@@ -1348,16 +1462,32 @@ export default class MarketMakerSettingsPage extends BasePage {
       th.appendChild(span)
       headerRow.appendChild(th)
 
-      // Add DEX data cell
-      const dexTd = document.createElement('td')
-      dexTd.className = 'text-center border'
-      dexRow.appendChild(dexTd)
+      // Add DEX data cell only if this asset is in DEX
+      if (dexAssetIDs.includes(assetID)) {
+        const dexTd = document.createElement('td')
+        dexTd.className = 'text-center border'
+        dexRow.appendChild(dexTd)
+      } else {
+        // Add empty cell for alignment
+        const dexTd = document.createElement('td')
+        dexTd.className = 'text-center border'
+        dexTd.textContent = '-'
+        dexRow.appendChild(dexTd)
+      }
 
-      // Add CEX data cell
-      if (i < 2 && this.specs.cexName) {
-        const cexTd = document.createElement('td')
-        cexTd.className = 'text-center border'
-        cexRow.appendChild(cexTd)
+      // Add CEX data cell only if this asset is in CEX
+      if (this.specs.cexName) {
+        if (cexAssetIDs.includes(assetID)) {
+          const cexTd = document.createElement('td')
+          cexTd.className = 'text-center border'
+          cexRow.appendChild(cexTd)
+        } else {
+          // Add empty cell for alignment
+          const cexTd = document.createElement('td')
+          cexTd.className = 'text-center border'
+          cexTd.textContent = '-'
+          cexRow.appendChild(cexTd)
+        }
       }
     }
 
@@ -1495,7 +1625,7 @@ export default class MarketMakerSettingsPage extends BasePage {
     const dexAssetIDs = this.requiredDexAssets(baseID, quoteID, this.updatedConfig.cexBaseID, this.updatedConfig.cexQuoteID)
     let cexAssetIDs : number[] = []
     if (this.specs.cexName) {
-      cexAssetIDs = [this.updatedConfig.cexBaseID, this.updatedConfig.cexQuoteID]
+      cexAssetIDs = this.requiredCexAssets(this.updatedConfig.cexBaseID, this.updatedConfig.cexQuoteID)
     }
 
     const updateBalanceInputs = (assetIDs: number[], location: 'dex' | 'cex', allocations: Record<number, number>) => {
@@ -1529,8 +1659,13 @@ export default class MarketMakerSettingsPage extends BasePage {
     const populateAllocationRow = (assetIDs: number[], row: PageElement, allocations: Record<number, { amount: number, status?: AllocationStatus }>) => {
       for (let i = 0; i < assetIDs.length; i++) {
         const td = row.children[i + 1] as PageElement
+        if (!td) continue // Skip if column doesn't exist
         const assetID = assetIDs[i]
         const asset = app().assets[assetID]
+        if (!asset) {
+          console.warn(`Asset ${assetID} not found`)
+          continue
+        }
         const alloc = allocations[assetID] ? allocations[assetID].amount : 0
         td.textContent = format(alloc, asset.unitInfo)
         setColor(td, allocations[assetID]?.status ?? 'insufficient')
@@ -1544,7 +1679,7 @@ export default class MarketMakerSettingsPage extends BasePage {
     populateAllocationRow(dexAssetIDs, dexRow, allocationResult.dex)
 
     if (this.specs.cexName) {
-      const cexAssetIDs = [this.updatedConfig.cexBaseID, this.updatedConfig.cexQuoteID]
+      const cexAssetIDs = this.requiredCexAssets(this.updatedConfig.cexBaseID, this.updatedConfig.cexQuoteID)
       populateAllocationRow(cexAssetIDs, cexRow, allocationResult.cex)
     }
   }
@@ -1568,7 +1703,7 @@ export default class MarketMakerSettingsPage extends BasePage {
     const perSellLot: PerLot = { cex: {}, dex: {} }
     const perBuyLot: PerLot = { cex: {}, dex: {} }
     const dexAssetIDs = this.requiredDexAssets(baseID, quoteID, cexBaseID, cexQuoteID)
-    const cexAssetIDs = [cexBaseID, cexQuoteID]
+    const cexAssetIDs = this.requiredCexAssets(cexBaseID, cexQuoteID)
 
     for (const assetID of dexAssetIDs) {
       perSellLot.dex[assetID] = newPerLotBreakdown()
@@ -1637,7 +1772,7 @@ export default class MarketMakerSettingsPage extends BasePage {
     const toAllocate: AllocationResult = { dex: {}, cex: {} }
 
     const dexAssetIDs = this.requiredDexAssets(baseID, quoteID, cexBaseID, cexQuoteID)
-    const cexAssetIDs = [cexBaseID, cexQuoteID]
+    const cexAssetIDs = this.requiredCexAssets(cexBaseID, cexQuoteID)
 
     for (const assetID of dexAssetIDs) {
       toAllocate.dex[assetID] = newAllocationDetail()
@@ -1739,7 +1874,7 @@ export default class MarketMakerSettingsPage extends BasePage {
     const { cexBaseID, cexQuoteID } = this.updatedConfig
 
     const dexAssetIDs = this.requiredDexAssets(baseID, quoteID, cexBaseID, cexQuoteID)
-    const cexAssetIDs = [cexBaseID, cexQuoteID]
+    const cexAssetIDs = this.requiredCexAssets(cexBaseID, cexQuoteID)
 
     let dexBaseSurplus = 0
     let dexQuoteSurplus = 0
@@ -1811,7 +1946,7 @@ export default class MarketMakerSettingsPage extends BasePage {
     const { cexBaseID, cexQuoteID } = this.updatedConfig
 
     const dexAssetIDs = this.requiredDexAssets(baseID, quoteID, cexBaseID, cexQuoteID)
-    const cexAssetIDs = [cexBaseID, cexQuoteID]
+    const cexAssetIDs = this.requiredCexAssets(cexBaseID, cexQuoteID)
 
     const totalBotBalance = (source: 'cex' | 'dex', assetID: number) => {
       let bals
@@ -1993,7 +2128,7 @@ export default class MarketMakerSettingsPage extends BasePage {
     const result : BotBalanceAllocation = { dex: {}, cex: {} }
 
     const dexAssetIDs = this.requiredDexAssets(this.specs.baseID, this.specs.quoteID, this.updatedConfig.cexBaseID, this.updatedConfig.cexQuoteID)
-    const cexAssetIDs = [this.updatedConfig.cexBaseID, this.updatedConfig.cexQuoteID]
+    const cexAssetIDs = this.requiredCexAssets(this.updatedConfig.cexBaseID, this.updatedConfig.cexQuoteID)
     const assetIDs = [...dexAssetIDs, ...cexAssetIDs]
 
     for (const assetID of assetIDs) {
