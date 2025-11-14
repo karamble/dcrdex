@@ -32,6 +32,8 @@ type CEXConfig struct {
 	APIKey string `json:"apiKey"`
 	// APISecret is the API secret for the CEX.
 	APISecret string `json:"apiSecret"`
+	// APIPassphrase is the API passphrase for the CEX (required by some exchanges like Bitget).
+	APIPassphrase string `json:"apiPassphrase,omitempty"`
 }
 
 // AutoRebalanceConfig configures deposits and withdrawals by setting minimum

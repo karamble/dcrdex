@@ -865,6 +865,7 @@ export interface CEXConfig {
   name: string
   apiKey: string
   apiSecret: string
+  apiPassphrase?: string
 }
 
 export interface MarketWithHost {

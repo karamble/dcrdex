@@ -585,7 +585,7 @@ func (m *MarketMaker) loadCEX(ctx context.Context, cfg *CEXConfig) (*centralized
 	defer m.cexMtx.Unlock()
 	var success bool
 	if cex := m.cexes[cfg.Name]; cex != nil {
-		if cex.APIKey == cfg.APIKey && cex.APISecret == cfg.APISecret {
+		if cex.APIKey == cfg.APIKey && cex.APISecret == cfg.APISecret && cex.APIPassphrase == cfg.APIPassphrase {
 			return cex, nil
 		}
 		if m.cexInUse(cfg.Name) {
@@ -603,10 +603,11 @@ func (m *MarketMaker) loadCEX(ctx context.Context, cfg *CEXConfig) (*centralized
 	}
 	logger := m.log.SubLogger(fmt.Sprintf("CEX-%s", cfg.Name))
 	cex, err := libxc.NewCEX(cfg.Name, &libxc.CEXConfig{
-		APIKey:    cfg.APIKey,
-		SecretKey: cfg.APISecret,
-		Logger:    logger,
-		Net:       m.core.Network(),
+		APIKey:        cfg.APIKey,
+		SecretKey:     cfg.APISecret,
+		APIPassphrase: cfg.APIPassphrase,
+		Logger:        logger,
+		Net:           m.core.Network(),
 		Notify: func(n interface{}) {
 			m.handleCEXUpdate(cfg.Name, n)
 		},
